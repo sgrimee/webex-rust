@@ -1,0 +1,146 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in library 'webex'",
+      "cargo": {
+        "args": ["test", "--no-run", "--lib", "--package=webex"],
+        "filter": {
+          "name": "webex",
+          "kind": "lib"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug example 'device-authentication'",
+      "cargo": {
+        "args": ["build", "--example=device-authentication", "--package=webex"],
+        "filter": {
+          "name": "device-authentication",
+          "kind": "example"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in example 'device-authentication'",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--example=device-authentication",
+          "--package=webex"
+        ],
+        "filter": {
+          "name": "device-authentication",
+          "kind": "example"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug example 'adaptivecard'",
+      "cargo": {
+        "args": ["build", "--example=adaptivecard", "--package=webex"],
+        "filter": {
+          "name": "adaptivecard",
+          "kind": "example"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in example 'adaptivecard'",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--example=adaptivecard",
+          "--package=webex"
+        ],
+        "filter": {
+          "name": "adaptivecard",
+          "kind": "example"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug example 'auto-reply'",
+      "cargo": {
+        "args": ["build", "--example=auto-reply", "--package=webex"],
+        "filter": {
+          "name": "auto-reply",
+          "kind": "example"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in example 'auto-reply'",
+      "cargo": {
+        "args": ["test", "--no-run", "--example=auto-reply", "--package=webex"],
+        "filter": {
+          "name": "auto-reply",
+          "kind": "example"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug example 'hello-world'",
+      "cargo": {
+        "args": ["build", "--example=hello-world", "--package=webex"],
+        "filter": {
+          "name": "hello-world",
+          "kind": "example"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in example 'hello-world'",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--example=hello-world",
+          "--package=webex"
+        ],
+        "filter": {
+          "name": "hello-world",
+          "kind": "example"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
