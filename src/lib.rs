@@ -131,7 +131,7 @@ impl WebexEventStream {
                 }
                 // Didn't time out
                 Ok(next_result) => match next_result {
-                    None => continue,
+                    None => {}
                     Some(msg) => match msg {
                         Ok(msg) => {
                             if let Some(h_msg) = self.handle_message(msg)? {
@@ -754,6 +754,89 @@ impl Webex {
             .map(|result| result.items)
     }
 
+    /// Leave a room by deleting the current user's membership
+    /// 
+    /// # Arguments
+    /// * `room_id`: The ID of the room to leave
+    /// 
+    /// # Errors
+    /// * [`ErrorKind::Limited`] - returned on HTTP 423/429 with an optional Retry-After.
+    /// * [`ErrorKind::Status`] | [`ErrorKind::StatusText`] - returned when the request results in a non-200 code.
+    /// * [`ErrorKind::Json`] - returned when input/output cannot be serialized/deserialized.
+    /// * [`ErrorKind::UTF8`] - returned when the request returns non-UTF8 code.
+    pub async fn leave_room(&self, room_id: &types::GlobalId) -> Result<(), Error> {
+        // First, get our own membership in this room
+        let membership_params = types::MembershipListParams {
+            room_id: Some(room_id.id()),
+            person_id: Some("me"),
+            ..Default::default()
+        };
+        
+        debug!("Fetching memberships for room: {}", room_id.id());
+        
+        // Try to get memberships, handling the case where we're not a member
+        let memberships = match self.list_with_params::<types::Membership>(membership_params.clone()).await {
+            Ok(memberships) => {
+                debug!("Found {} memberships", memberships.len());
+                memberships
+            }
+            Err(e) => {
+                debug!("Error fetching memberships: {}", e);
+                // If we get a deserialization error, it might be because the API returned an error response
+                // instead of membership data. Let's make a raw call to check what the API actually returned.
+                let error_str = format!("{}", e);
+                if error_str.contains("error decoding response body") {
+                    // Make a raw API call to see what the actual response is
+                    let rest_method = "memberships";
+                    match self.client
+                        .web_client
+                        .get(&format!("{}/{}", "https://webexapis.com/v1", rest_method))
+                        .query(&membership_params)
+                        .bearer_auth(&self.token)
+                        .send()
+                        .await 
+                    {
+                        Ok(response) => {
+                            let status = response.status();
+                            let text = response.text().await?;
+                            debug!("Raw membership API response (status {}): {}", status, text);
+                            
+                            // If it's a 404 or the response contains "not found", we're probably not a member
+                            if status.as_u16() == 404 || text.contains("not found") || text.contains("could not be found") {
+                                debug!("Room not found or not a member - considering leave operation successful");
+                                return Ok(());
+                            }
+                        }
+                        Err(api_e) => {
+                            debug!("Error making raw API call: {}", api_e);
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        };
+        
+        if let Some(membership) = memberships.first() {
+            debug!("Found membership with ID: {}", membership.id);
+            let membership_id = types::GlobalId::new(types::GlobalIdType::Membership, membership.id.clone())?;
+            let rest_method = format!("memberships/{}", membership_id.id());
+            debug!("Deleting membership via: {}", rest_method);
+            
+            match self.client.api_delete(&rest_method, None::<()>, AuthorizationType::Bearer(&self.token)).await {
+                Ok(_) => {
+                    debug!("Successfully left room: {}", room_id.id());
+                    Ok(())
+                }
+                Err(e) => {
+                    debug!("Error deleting membership: {}", e);
+                    Err(e)
+                }
+            }
+        } else {
+            Err(error::Error::UserError("User is not a member of this room".to_string()))
+        }
+    }
+
     async fn get_devices(&self) -> Result<Vec<DeviceData>, Error> {
         match self
             .client
@@ -866,5 +949,158 @@ impl MessageOut {
             content: card,
         }]);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockito::ServerGuard;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Helper function to create a test Webex client with mocked RestClient
+    async fn create_test_webex_client(server: &ServerGuard) -> Webex {
+        let mut host_prefix = HashMap::new();
+        host_prefix.insert("memberships".to_string(), server.url());
+        host_prefix.insert("memberships/Y2lzY29zcGFyazovL3VzL01FTUJFUlNISVAvODc2NTQzMjEtNDMyMS00MzIxLTQzMjEtMjEwOTg3NjU0MzIx".to_string(), server.url());
+        
+        let rest_client = RestClient {
+            host_prefix,
+            web_client: reqwest::Client::new(),
+        };
+        
+        let device = DeviceData {
+            url: Some("test_url".to_string()),
+            ws_url: Some("ws://test".to_string()),
+            device_name: Some("test_device".to_string()),
+            device_type: Some("DESKTOP".to_string()),
+            localized_model: Some("rust-sdk-test".to_string()),
+            modification_time: Some(chrono::Utc::now()),
+            model: Some("rust-sdk-test".to_string()),
+            name: Some(format!("rust-sdk-test-{}", COUNTER.fetch_add(1, Ordering::SeqCst))),
+            system_name: Some("rust-sdk-test".to_string()),
+            system_version: Some("0.1.0".to_string()),
+        };
+
+        Webex {
+            id: 1,
+            client: rest_client,
+            token: "test_token".to_string(),
+            device,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_leave_room_success() {
+        let mut server = mockito::Server::new_async().await;
+        
+        // Mock the membership list API call
+        let membership_mock = server
+            .mock("GET", "/memberships")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("roomId".into(), "Y2lzY29zcGFyazovL3VzL1JPT00vMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MDEy".into()),
+                mockito::Matcher::UrlEncoded("personId".into(), "me".into()),
+            ]))
+            .match_header("authorization", "Bearer test_token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({
+                "items": [{
+                    "id": "87654321-4321-4321-4321-210987654321",
+                    "roomId": "test_room_id",
+                    "personId": "test_person_id",
+                    "personEmail": "test@example.com",
+                    "personDisplayName": "Test User",
+                    "personOrgId": "test_org_id",
+                    "isModerator": false,
+                    "isMonitor": false,
+                    "created": "2024-01-01T00:00:00.000Z"
+                }]
+            }).to_string())
+            .create_async()
+            .await;
+        
+        // Mock the membership deletion API call
+        let delete_mock = server
+            .mock("DELETE", "/memberships/Y2lzY29zcGFyazovL3VzL01FTUJFUlNISVAvODc2NTQzMjEtNDMyMS00MzIxLTQzMjEtMjEwOTg3NjU0MzIx")
+            .match_header("authorization", "Bearer test_token")
+            .with_status(204)
+            .with_body("")
+            .create_async()
+            .await;
+
+        let webex_client = create_test_webex_client(&server).await;
+        let room_id = types::GlobalId::new(types::GlobalIdType::Room, "12345678-1234-1234-1234-123456789012".to_string()).unwrap();
+        
+        let result = webex_client.leave_room(&room_id).await;
+        
+        assert!(result.is_ok());
+        membership_mock.assert_async().await;
+        delete_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_leave_room_user_not_member() {
+        let mut server = mockito::Server::new_async().await;
+        
+        // Mock the membership list API call returning empty list
+        let membership_mock = server
+            .mock("GET", "/memberships")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("roomId".into(), "Y2lzY29zcGFyazovL3VzL1JPT00vMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MDEy".into()),
+                mockito::Matcher::UrlEncoded("personId".into(), "me".into()),
+            ]))
+            .match_header("authorization", "Bearer test_token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({
+                "items": []
+            }).to_string())
+            .create_async()
+            .await;
+
+        let webex_client = create_test_webex_client(&server).await;
+        let room_id = types::GlobalId::new(types::GlobalIdType::Room, "12345678-1234-1234-1234-123456789012".to_string()).unwrap();
+        
+        let result = webex_client.leave_room(&room_id).await;
+        
+        assert!(result.is_err());
+        if let Err(error) = result {
+            assert_eq!(error.to_string(), "User is not a member of this room");
+        }
+        membership_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_leave_room_api_error() {
+        let mut server = mockito::Server::new_async().await;
+        
+        // Mock the membership list API call returning error
+        let membership_mock = server
+            .mock("GET", "/memberships")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("roomId".into(), "Y2lzY29zcGFyazovL3VzL1JPT00vMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MDEy".into()),
+                mockito::Matcher::UrlEncoded("personId".into(), "me".into()),
+            ]))
+            .match_header("authorization", "Bearer test_token")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(json!({
+                "message": "Access denied",
+                "errors": []
+            }).to_string())
+            .create_async()
+            .await;
+
+        let webex_client = create_test_webex_client(&server).await;
+        let room_id = types::GlobalId::new(types::GlobalIdType::Room, "12345678-1234-1234-1234-123456789012".to_string()).unwrap();
+        
+        let result = webex_client.leave_room(&room_id).await;
+        
+        assert!(result.is_err());
+        membership_mock.assert_async().await;
     }
 }

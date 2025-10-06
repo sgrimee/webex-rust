@@ -14,7 +14,7 @@ pub(crate) use api::{Gettable, ListResult};
 mod api {
     //! Private crate to hold all types that the user shouldn't have to interact with.
     use super::{
-        AttachmentAction, Message, MessageListParams, Organization, Person, Room, RoomListParams,
+        AttachmentAction, Membership, MembershipListParams, Message, MessageListParams, Organization, Person, Room, RoomListParams,
         Team,
     };
 
@@ -58,6 +58,11 @@ mod api {
     impl Gettable for Team {
         const API_ENDPOINT: &'static str = "teams";
         type ListParams<'a> = Option<Infallible>;
+    }
+
+    impl Gettable for Membership {
+        const API_ENDPOINT: &'static str = "memberships";
+        type ListParams<'a> = MembershipListParams<'a>;
     }
 
     #[derive(crate::types::Deserialize)]
@@ -152,6 +157,51 @@ pub struct Team {
     pub created: String,
     /// Team description
     pub description: Option<String>,
+}
+
+/// Webex Teams membership information
+#[skip_serializing_none]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Membership {
+    /// A unique identifier for the membership.
+    pub id: String,
+    /// The room ID associated with this membership.
+    #[serde(default)]
+    pub room_id: String,
+    /// The person ID associated with this membership.
+    #[serde(default)]
+    pub person_id: String,
+    /// The email address of the person.
+    pub person_email: Option<String>,
+    /// The display name of the person.
+    pub person_display_name: Option<String>,
+    /// The organization ID of the person.
+    pub person_org_id: Option<String>,
+    /// Whether or not the participant is a moderator of the room.
+    #[serde(default)]
+    pub is_moderator: Option<bool>,
+    /// Whether or not the participant is monitoring the room (i.e. room is in one's space list).
+    #[serde(default)]
+    pub is_monitor: Option<bool>,
+    /// The date and time when the membership was created.
+    pub created: Option<String>,
+}
+
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Parameters for listing memberships
+pub struct MembershipListParams<'a> {
+    /// List memberships for a room, by ID.
+    pub room_id: Option<&'a str>,
+    /// List memberships for a person, by ID.
+    pub person_id: Option<&'a str>,
+    /// List memberships for a person, by email address.
+    pub person_email: Option<&'a str>,
+    /// Limit the maximum number of memberships in the response.
+    /// Default: 100
+    pub max: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -612,8 +662,7 @@ impl Event {
                             ActivityType::Space(type_)
                         } else {
                             log::error!(
-                                "Unknown activity type `{}`, returning Unknown",
-                                activity_type
+                                "Unknown activity type `{activity_type}`, returning Unknown"
                             );
                             ActivityType::Unknown(format!("conversation.activity.{activity_type}"))
                         }
@@ -742,8 +791,10 @@ pub enum GlobalIdType {
     Team,
     /// Retrieves a specific attachment
     AttachmentAction,
-    /// This `GlobalId` represents the ID of something not currently recognised, any API requests
-    /// with this `GlobalId` will produce an error.
+    /// Corresponds to the ID of a membership
+    Membership,
+    /// This GlobalId represents the ID of something not currently recognised, any API requests
+    /// with this GlobalId will produce an error.
     Unknown,
 }
 impl From<ActivityType> for GlobalIdType {
@@ -779,6 +830,7 @@ impl std::fmt::Display for GlobalIdType {
                 Self::Room => "ROOM",
                 Self::Team => "TEAM",
                 Self::AttachmentAction => "ATTACHMENT_ACTION",
+                Self::Membership => "MEMBERSHIP",
                 Self::Unknown => "<UNKNOWN>",
             }
         )
@@ -1161,7 +1213,7 @@ mod tests {
             event.room_id_of_space_created_event().unwrap(),
             "1ab849e0-9ab4-11ee-a70f-d9b57e49f8bf"
         );
-        // invalid UUID (assumed base64) should return itself unmodified
+        // invalid UUID (assumed base64) should not be changed
         event.data.activity = Some(Activity {
             verb: "create".to_string(),
             id: "bogus".to_string(),
