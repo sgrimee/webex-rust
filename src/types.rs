@@ -14,8 +14,8 @@ pub(crate) use api::{Gettable, ListResult};
 mod api {
     //! Private crate to hold all types that the user shouldn't have to interact with.
     use super::{
-        AttachmentAction, Message, MessageListParams, Organization, Person, Room, RoomListParams,
-        Team,
+        AttachmentAction, Membership, MembershipListParams, Message, MessageListParams,
+        Organization, Person, Room, RoomListParams, Team,
     };
 
     /// Trait for API types. Has to be public due to trait bounds limitations on webex API, but hidden
@@ -58,6 +58,11 @@ mod api {
     impl Gettable for Team {
         const API_ENDPOINT: &'static str = "teams";
         type ListParams<'a> = Option<Infallible>;
+    }
+
+    impl Gettable for Membership {
+        const API_ENDPOINT: &'static str = "memberships";
+        type ListParams<'a> = MembershipListParams<'a>;
     }
 
     #[derive(crate::types::Deserialize)]
@@ -152,6 +157,63 @@ pub struct Team {
     pub created: String,
     /// Team description
     pub description: Option<String>,
+}
+
+/// Membership information
+#[skip_serializing_none]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Membership {
+    /// A unique identifier for the membership.
+    pub id: String,
+    /// The room ID.
+    pub room_id: String,
+    /// The person ID.
+    pub person_id: String,
+    /// The email address of the person.
+    pub person_email: String,
+    /// The display name of the person.
+    pub person_display_name: String,
+    /// The organization ID of the person.
+    pub person_org_id: String,
+    /// Whether or not the participant is a room moderator.
+    pub is_moderator: bool,
+    /// Whether or not the direct space is hidden in the Webex clients.
+    pub is_room_hidden: Option<bool>,
+    /// The date and time when the room was last read by the participant.
+    pub last_seen_id: Option<String>,
+    /// The date and time the membership was created.
+    pub created: String,
+}
+
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Parameters for listing memberships
+pub struct MembershipListParams<'a> {
+    /// List memberships in a room, by ID.
+    pub room_id: Option<&'a str>,
+    /// List memberships for a person, by ID.
+    pub person_id: Option<&'a str>,
+    /// List memberships for a person, by email address.
+    pub person_email: Option<&'a str>,
+    /// Limit the maximum number of memberships in the response.
+    /// Default: 100
+    pub max: Option<u32>,
+}
+
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Parameters for updating a membership
+pub struct MembershipUpdateParams<'a> {
+    /// Whether or not the participant is a room moderator.
+    pub is_moderator: Option<bool>,
+    /// Whether or not the direct space is hidden in the Webex clients.
+    pub is_room_hidden: Option<bool>,
+    /// The ID of the last message read by the user.
+    /// This field is used to mark messages as read.
+    pub last_seen_id: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

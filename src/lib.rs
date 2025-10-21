@@ -21,6 +21,7 @@
 //! - Monitoring an event stream
 //! - Sending direct or group messages
 //! - Getting room memberships
+//! - Marking messages as read (syncs read status across all clients)
 //! - Building `AdaptiveCards` and retrieving responses
 //!
 //! Not all features are fully-fleshed out, particularly the `AdaptiveCard`
@@ -752,6 +753,83 @@ impl Webex {
             )
             .await
             .map(|result| result.items)
+    }
+
+    /// Mark a message as read on the server
+    ///
+    /// This updates the membership's `lastSeenId` field to indicate that the message
+    /// has been read. This allows other clients to see the message as read.
+    ///
+    /// # Arguments
+    /// * `message_id` - The ID of the message to mark as read
+    /// * `room_id` - The ID of the room containing the message
+    ///
+    /// # Errors
+    /// * [`Error::Limited`] - returned on HTTP 423/429 with an optional Retry-After.
+    /// * [`Error::Status`] | [`Error::StatusText`] - returned when the request results in a non-200 code.
+    /// * [`Error::Json`] - returned when your input object cannot be serialized, or the return
+    ///   value cannot be deserialised.
+    /// * [`Error::UTF8`] - returned when the request returns non-UTF8 code.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # async fn example() -> Result<(), webex::error::Error> {
+    /// let webex = webex::Webex::new("token").await;
+    /// let message_id = "message_id_here";
+    /// let room_id = "room_id_here";
+    /// webex.mark_message_as_read(message_id, room_id).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn mark_message_as_read(
+        &self,
+        message_id: &str,
+        room_id: &str,
+    ) -> Result<(), Error> {
+        // First, get the user's own person ID
+        let person = self
+            .client
+            .api_get::<Person>(
+                "people/me",
+                None::<()>,
+                AuthorizationType::Bearer(&self.token),
+            )
+            .await?;
+
+        // Get the membership for this person in this room
+        let params = MembershipListParams {
+            room_id: Some(room_id),
+            person_id: Some(&person.id),
+            person_email: None,
+            max: None,
+        };
+
+        let memberships = self.list_with_params::<Membership>(params).await?;
+
+        if memberships.is_empty() {
+            return Err("No membership found for this room".into());
+        }
+
+        let membership = &memberships[0];
+
+        // Update the membership with the lastSeenId
+        let update_params = MembershipUpdateParams {
+            is_moderator: None,
+            is_room_hidden: None,
+            last_seen_id: Some(message_id),
+        };
+
+        let rest_method = format!("memberships/{}", membership.id);
+        self.client
+            .api_put::<Membership>(
+                &rest_method,
+                update_params,
+                None::<()>,
+                AuthorizationType::Bearer(&self.token),
+            )
+            .await?;
+
+        Ok(())
     }
 
     async fn get_devices(&self) -> Result<Vec<DeviceData>, Error> {
