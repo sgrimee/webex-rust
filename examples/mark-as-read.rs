@@ -4,15 +4,16 @@ const BOT_ACCESS_TOKEN: &str = "BOT_ACCESS_TOKEN";
 const BOT_EMAIL: &str = "BOT_EMAIL";
 
 ///
-/// # Mark Messages as Read
+/// # Mark Messages as Read/Unread
 ///
-/// This example demonstrates how to mark messages as read on the server.
-/// When a message is marked as read, other Webex clients will also see it as read.
+/// This example demonstrates how to mark messages as read or unread on the server.
+/// When a message is marked as read/unread, other Webex clients will also see it as read/unread.
 ///
 /// The bot will:
 /// 1. Listen for incoming messages
-/// 2. Reply to the message
-/// 3. Mark the message as read on the server
+/// 2. If the message contains "read", mark it as read
+/// 3. If the message contains "unread", mark it as unread
+/// 4. Reply with the action taken
 ///
 /// # Usage
 ///
@@ -53,25 +54,75 @@ async fn main() {
                 match &msg.person_email {
                     // Reply as long as it doesn't appear to be our own message
                     Some(sender) if sender != bot_email.as_str() => {
+                        let message_text = msg.text.as_ref().map(|s| s.to_lowercase());
                         println!("Received message from {}: {:?}", sender, msg.text);
 
-                        // Send a reply
-                        let mut reply = webex::types::MessageOut::from(&msg);
-                        reply.text = Some(format!(
-                            "Message received! I'm marking it as read on the server."
-                        ));
-                        webex.send_message(&reply).await.unwrap();
-
-                        // Mark the original message as read
                         let message_id = msg.id.as_ref().unwrap();
                         let room_id = msg.room_id.as_ref().unwrap();
 
-                        match webex.mark_message_as_read(message_id, room_id).await {
-                            Ok(()) => {
-                                println!("Successfully marked message as read: {}", message_id);
+                        // Determine action based on message content
+                        let action = if let Some(text) = &message_text {
+                            if text.contains("unread") {
+                                Some("unread")
+                            } else if text.contains("read") {
+                                Some("read")
+                            } else {
+                                None
                             }
-                            Err(e) => {
-                                eprintln!("Failed to mark message as read: {:?}", e);
+                        } else {
+                            None
+                        };
+
+                        match action {
+                            Some("read") => {
+                                // Mark the original message as read
+                                match webex.mark_message_as_read(message_id, room_id).await {
+                                    Ok(()) => {
+                                        println!("Successfully marked message as read: {}", message_id);
+                                        let mut reply = webex::types::MessageOut::from(&msg);
+                                        reply.text = Some(format!(
+                                            "✓ Message marked as **read** on the server. Other clients will see it as read."
+                                        ));
+                                        webex.send_message(&reply).await.unwrap();
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to mark message as read: {:?}", e);
+                                        let mut reply = webex::types::MessageOut::from(&msg);
+                                        reply.text = Some(format!(
+                                            "❌ Failed to mark message as read: {:?}", e
+                                        ));
+                                        webex.send_message(&reply).await.unwrap();
+                                    }
+                                }
+                            }
+                            Some("unread") => {
+                                // Mark the original message as unread
+                                match webex.mark_message_as_unread(message_id, room_id).await {
+                                    Ok(()) => {
+                                        println!("Successfully marked message as unread: {}", message_id);
+                                        let mut reply = webex::types::MessageOut::from(&msg);
+                                        reply.text = Some(format!(
+                                            "✓ Message marked as **unread** on the server. Other clients will see it as unread."
+                                        ));
+                                        webex.send_message(&reply).await.unwrap();
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to mark message as unread: {:?}", e);
+                                        let mut reply = webex::types::MessageOut::from(&msg);
+                                        reply.text = Some(format!(
+                                            "❌ Failed to mark message as unread: {:?}", e
+                                        ));
+                                        webex.send_message(&reply).await.unwrap();
+                                    }
+                                }
+                            }
+                            None => {
+                                // Send help message
+                                let mut reply = webex::types::MessageOut::from(&msg);
+                                reply.text = Some(format!(
+                                    "Hi! Send a message containing 'read' to mark it as read, or 'unread' to mark it as unread.\n\nExamples:\n- 'mark this as read'\n- 'set to unread'"
+                                ));
+                                webex.send_message(&reply).await.unwrap();
                             }
                         }
                     }

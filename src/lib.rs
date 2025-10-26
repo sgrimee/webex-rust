@@ -21,7 +21,7 @@
 //! - Monitoring an event stream
 //! - Sending direct or group messages
 //! - Getting room memberships
-//! - Marking messages as read (syncs read status across all clients)
+//! - Marking messages as read or unread (syncs read status across all clients)
 //! - Building `AdaptiveCards` and retrieving responses
 //!
 //! Not all features are fully-fleshed out, particularly the `AdaptiveCard`
@@ -786,6 +786,71 @@ impl Webex {
         message_id: &str,
         room_id: &str,
     ) -> Result<(), Error> {
+        self.update_read_status(room_id, Some(message_id)).await
+    }
+
+    /// Mark a message as unread on the server
+    ///
+    /// This updates the membership's `lastSeenId` field to point to the message before
+    /// the target message, causing the target message (and all subsequent messages) to
+    /// appear as unread. This allows other clients to see the message as unread.
+    ///
+    /// # Arguments
+    /// * `message_id` - The ID of the message to mark as unread
+    /// * `room_id` - The ID of the room containing the message
+    ///
+    /// # Errors
+    /// * [`Error::Limited`] - returned on HTTP 423/429 with an optional Retry-After.
+    /// * [`Error::Status`] | [`Error::StatusText`] - returned when the request results in a non-200 code.
+    /// * [`Error::Json`] - returned when your input object cannot be serialized, or the return
+    ///   value cannot be deserialised.
+    /// * [`Error::UTF8`] - returned when the request returns non-UTF8 code.
+    /// * Returns an error if the message is the first message in the room.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # async fn example() -> Result<(), webex::error::Error> {
+    /// let webex = webex::Webex::new("token").await;
+    /// let message_id = "message_id_here";
+    /// let room_id = "room_id_here";
+    /// webex.mark_message_as_unread(message_id, room_id).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn mark_message_as_unread(
+        &self,
+        message_id: &str,
+        room_id: &str,
+    ) -> Result<(), Error> {
+        // To mark a message as unread, we need to find the message that comes before it
+        // and set lastSeenId to that previous message
+        let params = MessageListParams {
+            room_id,
+            parent_id: None,
+            mentioned_people: &[],
+            before: None,
+            before_message: Some(message_id),
+            max: Some(1),
+        };
+
+        let messages = self.list_with_params::<Message>(params).await?;
+
+        if messages.is_empty() {
+            // This is the first message in the room, set lastSeenId to None to mark all as unread
+            self.update_read_status(room_id, None).await
+        } else {
+            // Set lastSeenId to the previous message
+            let previous_message_id = messages[0].id.as_ref().ok_or("Message has no ID")?;
+            self.update_read_status(room_id, Some(previous_message_id)).await
+        }
+    }
+
+    /// Internal helper to update the read status for a room
+    async fn update_read_status(
+        &self,
+        room_id: &str,
+        last_seen_id: Option<&str>,
+    ) -> Result<(), Error> {
         // First, get the user's own person ID
         let person = self
             .client
@@ -816,7 +881,7 @@ impl Webex {
         let update_params = MembershipUpdateParams {
             is_moderator: None,
             is_room_hidden: None,
-            last_seen_id: Some(message_id),
+            last_seen_id,
         };
 
         let rest_method = format!("memberships/{}", membership.id);
