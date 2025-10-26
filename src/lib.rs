@@ -755,6 +755,83 @@ impl Webex {
             .map(|result| result.items)
     }
 
+    /// Get a room with read status information
+    ///
+    /// This method retrieves a room and returns it with read status tracking.
+    /// Note: The REST API doesn't directly provide lastSeenId or lastSeenDate fields.
+    /// You can track read status locally or listen for memberships:seen events via WebSocket.
+    ///
+    /// # Arguments
+    /// * `room_id` - The ID of the room to get
+    ///
+    /// # Errors
+    /// * [`Error::Limited`] - returned on HTTP 423/429 with an optional Retry-After.
+    /// * [`Error::Status`] | [`Error::StatusText`] - returned when the request results in a non-200 code.
+    pub async fn get_room_with_read_status(
+        &self,
+        room_id: &GlobalId,
+    ) -> Result<RoomWithReadStatus, Error> {
+        let room: Room = self.get(room_id).await?;
+        let read_status = ReadStatus::from_room(&room);
+        Ok(RoomWithReadStatus { room, read_status })
+    }
+
+    /// List all rooms with read status information
+    ///
+    /// This method retrieves all rooms and returns them with read status tracking.
+    /// Note: The REST API doesn't directly provide lastSeenId or lastSeenDate fields.
+    /// You can track read status locally or listen for memberships:seen events via WebSocket.
+    ///
+    /// # Errors
+    /// * [`Error::Limited`] - returned on HTTP 423/429 with an optional Retry-After.
+    /// * [`Error::Status`] | [`Error::StatusText`] - returned when the request results in a non-200 code.
+    pub async fn list_rooms_with_read_status(&self) -> Result<Vec<RoomWithReadStatus>, Error> {
+        let rooms: Vec<Room> = self.list().await?;
+        Ok(rooms
+            .into_iter()
+            .map(|room| {
+                let read_status = ReadStatus::from_room(&room);
+                RoomWithReadStatus { room, read_status }
+            })
+            .collect())
+    }
+
+    /// Get memberships for a specific room
+    ///
+    /// # Arguments
+    /// * `room_id` - The ID of the room to get memberships for
+    ///
+    /// # Errors
+    /// * [`Error::Limited`] - returned on HTTP 423/429 with an optional Retry-After.
+    /// * [`Error::Status`] | [`Error::StatusText`] - returned when the request results in a non-200 code.
+    pub async fn get_room_memberships(&self, room_id: &str) -> Result<Vec<Membership>, Error> {
+        let params = MembershipListParams {
+            room_id: Some(room_id),
+            person_id: None,
+            person_email: None,
+            max: None,
+        };
+        self.list_with_params::<Membership>(params).await
+    }
+
+    /// Get memberships for a specific person
+    ///
+    /// # Arguments
+    /// * `person_id` - The ID of the person to get memberships for
+    ///
+    /// # Errors
+    /// * [`Error::Limited`] - returned on HTTP 423/429 with an optional Retry-After.
+    /// * [`Error::Status`] | [`Error::StatusText`] - returned when the request results in a non-200 code.
+    pub async fn get_person_memberships(&self, person_id: &str) -> Result<Vec<Membership>, Error> {
+        let params = MembershipListParams {
+            room_id: None,
+            person_id: Some(person_id),
+            person_email: None,
+            max: None,
+        };
+        self.list_with_params::<Membership>(params).await
+    }
+
     /// Mark a message as read on the server
     ///
     /// This updates the membership's `lastSeenId` field to indicate that the message
