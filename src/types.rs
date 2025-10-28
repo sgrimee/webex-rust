@@ -3,6 +3,7 @@
 
 use crate::{adaptive_card::AdaptiveCard, error};
 use base64::Engine;
+
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::convert::TryFrom;
@@ -160,32 +161,33 @@ pub struct Team {
 }
 
 /// Webex Teams membership information
-#[skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Membership {
     /// A unique identifier for the membership.
     pub id: String,
     /// The room ID associated with this membership.
-    #[serde(default)]
+    #[serde(default, rename = "roomId")]
     pub room_id: String,
     /// The person ID associated with this membership.
-    #[serde(default)]
+    #[serde(default, rename = "personId")]
     pub person_id: String,
     /// The email address of the person.
+    #[serde(rename = "personEmail")]
     pub person_email: Option<String>,
     /// The display name of the person.
+    #[serde(rename = "personDisplayName")]
     pub person_display_name: Option<String>,
     /// The organization ID of the person.
+    #[serde(rename = "personOrgId")]
     pub person_org_id: Option<String>,
     /// Whether or not the participant is a moderator of the room.
-    #[serde(default)]
-    pub is_moderator: Option<bool>,
-    /// Whether or not the participant is monitoring the room (i.e. room is in one's space list).
-    #[serde(default)]
-    pub is_monitor: Option<bool>,
+    #[serde(rename = "isModerator")]
+    pub is_moderator: bool,
+    /// Whether or not the participant is a monitor of the room.
+    #[serde(rename = "isMonitor")]
+    pub is_monitor: bool,
     /// The date and time when the membership was created.
-    pub created: Option<String>,
+    pub created: String,
 }
 
 #[skip_serializing_none]
@@ -386,6 +388,7 @@ pub struct MessageEditParams<'a> {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[allow(dead_code)]
 pub(crate) struct EmptyReply {}
 
 /// API Error
@@ -1084,18 +1087,20 @@ pub struct Person {
     /// The email addresses of the person.
     pub emails: Vec<String>,
     /// Phone numbers for the person.
-    pub phone_numbers: Vec<PhoneNumber>,
+    pub phone_numbers: Option<Vec<PhoneNumber>>,
     /// The full name of the person.
+    #[serde(rename = "displayName")]
     pub display_name: String,
     /// The nickname of the person if configured. If no nickname is configured for the person, this field will not be present.
-    pub nick_name: String,
+    pub nick_name: Option<String>,
     /// The first name of the person.
-    pub first_name: String,
+    pub first_name: Option<String>,
     /// The last name of the person.
-    pub last_name: String,
+    pub last_name: Option<String>,
     /// The URL to the person's avatar in PNG format.
-    pub avatar: String,
+    pub avatar: Option<String>,
     /// The ID of the organization to which this person belongs.
+    #[serde(rename = "orgId")]
     pub org_id: String,
     /// The date and time the person was created.
     pub created: String,
