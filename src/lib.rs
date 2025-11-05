@@ -437,7 +437,12 @@ where {
             }
             
             // Fallback to generic HTTP error
-            debug!("HTTP {} error for {}: {}", status.as_u16(), full_url, error_text);
+            // Device/mercury endpoints returning 403 indicate missing OAuth scopes
+            if status.as_u16() == 403 && (full_url.contains("u2c.wbx2.com") || full_url.contains("wdm")) {
+                error!("HTTP 403 for {}: {} - likely missing required OAuth scopes", full_url, error_text);
+            } else {
+                error!("HTTP {} error for {}: {}", status.as_u16(), full_url, error_text);
+            }
             return Err(Error::StatusText(status, error_text));
         }
         
@@ -585,7 +590,7 @@ impl Webex {
             Ok(device) => connect_device(self, device).await,
             Err(e) => match &e {
                 Error::StatusText(status, _) if *status == StatusCode::FORBIDDEN => {
-                    debug!("Device creation returned 403 - may need spark:devices_write scope in integration");
+                    error!("Device creation failed with 403 - event stream REQUIRES spark:devices_write and spark:devices_read scopes in your Webex integration");
                     Err(e)
                 }
                 _ => {
@@ -961,22 +966,62 @@ impl Webex {
                 debug!("Chaining one-time device setup from devices query");
                 self.setup_devices().await.map(|device| vec![device])
             }
-            Err(e) => match e {
-                Error::Status(s) | Error::StatusText(s, _) => {
-                    if s == StatusCode::NOT_FOUND {
-                        debug!("No devices found, creating new one");
+            Err(e) => match &e {
+                Error::Status(s) => {
+                    if *s == StatusCode::NOT_FOUND {
+                        debug!("No devices found (404), will create new device");
                         self.setup_devices().await.map(|device| vec![device])
-                    } else if s == StatusCode::FORBIDDEN {
-                        debug!("Device endpoint returned 403 Forbidden - expected for third-party integrations, creating new device");
+                    } else if *s == StatusCode::FORBIDDEN {
+                        error!("========================================================================");
+                        error!("Device endpoint returned 403 Forbidden");
+                        error!("========================================================================");
+                        error!("  Your Webex integration token is missing required OAuth scopes:");
+                        error!("    - spark:devices_write  (required to register device)");
+                        error!("    - spark:devices_read   (required to list devices)");
+                        error!("========================================================================");
                         match self.setup_devices().await {
-                            Ok(device) => Ok(vec![device]),
+                            Ok(device) => {
+                                debug!("Surprisingly, device creation succeeded despite 403 on list");
+                                Ok(vec![device])
+                            }
                             Err(setup_err) => {
-                                debug!("Setup devices also failed (expected): {setup_err}");
-                                // Return empty vec so event_stream can create a device via the fallback path
-                                Ok(vec![])
+                                error!("Device creation also failed (expected): {setup_err}");
+                                error!("Cannot proceed without device access");
+                                Err(e)
                             }
                         }
                     } else {
+                        error!("Unexpected HTTP status {} when listing devices", s);
+                        Err(e)
+                    }
+                }
+                Error::StatusText(s, msg) => {
+                    if *s == StatusCode::NOT_FOUND {
+                        debug!("No devices found (404), will create new device");
+                        self.setup_devices().await.map(|device| vec![device])
+                    } else if *s == StatusCode::FORBIDDEN {
+                        error!("========================================================================");
+                        error!("Device endpoint returned 403 Forbidden");
+                        error!("========================================================================");
+                        error!("  Your Webex integration token is missing required OAuth scopes:");
+                        error!("    - spark:devices_write  (required to register device)");
+                        error!("    - spark:devices_read   (required to list devices)");
+                        error!("");
+                        error!("  Error details: {}", msg);
+                        error!("========================================================================");
+                        match self.setup_devices().await {
+                            Ok(device) => {
+                                debug!("Surprisingly, device creation succeeded despite 403 on list");
+                                Ok(vec![device])
+                            }
+                            Err(setup_err) => {
+                                error!("Device creation also failed (expected): {setup_err}");
+                                error!("Cannot proceed without device access");
+                                Err(e)
+                            }
+                        }
+                    } else {
+                        error!("Unexpected HTTP status {} when listing devices: {}", s, msg);
                         Err(e)
                     }
                 }
