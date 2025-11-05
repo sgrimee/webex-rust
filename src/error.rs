@@ -31,7 +31,7 @@ pub enum Error {
 
     #[error("Authentication error")]
     Authentication,
-    
+
     #[error("{0}")]
     UserError(String),
 
