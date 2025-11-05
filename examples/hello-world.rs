@@ -24,12 +24,12 @@ const DEST_EMAIL: &str = "DEST_EMAIL";
 #[tokio::main]
 async fn main() {
     let token = env::var(BOT_ACCESS_TOKEN)
-        .unwrap_or_else(|_| panic!("{} not specified in environment", BOT_ACCESS_TOKEN));
+        .unwrap_or_else(|_| panic!("{BOT_ACCESS_TOKEN} not specified in environment"));
     let to_email = env::var(DEST_EMAIL)
-        .unwrap_or_else(|_| panic!("{} not specified in environment", DEST_EMAIL));
+        .unwrap_or_else(|_| panic!("{DEST_EMAIL} not specified in environment"));
 
     let webex = webex::Webex::new(token.as_str()).await;
-    let text = format!("Hello, {}", to_email);
+    let text = format!("Hello, {to_email}");
 
     let msg_to_send = webex::types::MessageOut {
         to_person_email: Some(to_email),
