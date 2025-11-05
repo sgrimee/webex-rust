@@ -519,6 +519,49 @@ impl Webex {
         webex
     }
 
+    /// Constructs a new Webex Teams context from a token, device name, and mercury URL
+    /// This constructor uses a pre-configured mercury URL instead of discovering it via U2C
+    /// The mercury_url should typically be "https://wdm-a.wbx2.com/wdm/api/v1"
+    pub async fn new_with_mercury_url(device_name: &str, token: &str, mercury_url: &str) -> Self {
+        let mut client: RestClient = RestClient {
+            host_prefix: HashMap::new(),
+            web_client: reqwest::Client::new(),
+        };
+
+        let mut hasher = DefaultHasher::new();
+        hash::Hash::hash_slice(token.as_bytes(), &mut hasher);
+        let id = hasher.finish();
+
+        // Have to insert this before any API calls that might use the U2C catalog
+        client
+            .host_prefix
+            .insert("limited/catalog".to_string(), U2C_HOST_PREFIX.to_string());
+
+        // Directly set the devices URL without discovery
+        client
+            .host_prefix
+            .insert("devices".to_string(), mercury_url.to_string());
+
+        trace!("Created Webex client with pre-configured mercury URL: {}", mercury_url);
+
+        Self {
+            id,
+            client,
+            token: token.to_string(),
+            device: DeviceData {
+                device_name: Some(DEFAULT_DEVICE_NAME.to_string()),
+                device_type: Some("DESKTOP".to_string()),
+                localized_model: Some("rust".to_string()),
+                model: Some(format!("rust-v{CRATE_VERSION}")),
+                name: Some(device_name.to_owned()),
+                system_name: Some(DEVICE_SYSTEM_NAME.to_string()),
+                system_version: Some(CRATE_VERSION.to_string()),
+                ..DeviceData::default()
+            },
+            user_id: Arc::new(Mutex::new(None)),
+        }
+    }
+
     /// Get an event stream handle
     pub async fn event_stream(&self) -> Result<WebexEventStream, Error> {
         // Helper function to connect to a device
