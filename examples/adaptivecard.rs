@@ -34,7 +34,7 @@ async fn main() {
         let event = match eventstream.next().await {
             Ok(event) => event,
             Err(e) => {
-                println!("Eventstream failed: {}", e);
+                println!("Eventstream failed: {e}");
                 continue;
             }
         };
@@ -57,16 +57,13 @@ async fn handle_adaptive_card(webex: &webex::Webex, event: &webex::Event) {
         match webex.get(&event.try_global_id().unwrap()).await {
             Ok(a) => a,
             Err(e) => {
-                println!("Error: {}", e);
+                println!("Error: {e}");
                 return;
             }
         };
     let which_card = actions.inputs.as_ref().and_then(|inputs| inputs.get("id"));
     match which_card {
-        None => println!(
-            "ERROR: expected card to have both inputs and id, got {:?}",
-            actions
-        ),
+        None => println!("ERROR: expected card to have both inputs and id, got {actions:?}"),
         Some(s) => match s.as_str() {
             // s is serde::Value so we have to check if it's actually a string (as_str produces an
             // Option)
@@ -87,10 +84,7 @@ async fn handle_adaptive_card_init(webex: &webex::Webex, actions: &webex::Attach
         .as_ref()
         .and_then(|inputs| inputs.get("input2"));
     if let (Some(input1), Some(input2)) = (input1, input2) {
-        println!(
-            "Recieved initial adaptive card, inputs {} and {}",
-            input1, input2
-        );
+        println!("Recieved initial adaptive card, inputs {input1} and {input2}");
         return;
     }
 
@@ -113,7 +107,7 @@ async fn respond_to_message(webex: &webex::Webex, config: &Config, event: &webex
     let message: webex::Message = match webex.get(&event.try_global_id().unwrap()).await {
         Ok(msg) => msg,
         Err(e) => {
-            println!("Failed to get message: {}", e);
+            println!("Failed to get message: {e}");
             return;
         }
     };

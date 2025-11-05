@@ -15,8 +15,8 @@ pub(crate) use api::{Gettable, ListResult};
 mod api {
     //! Private crate to hold all types that the user shouldn't have to interact with.
     use super::{
-        AttachmentAction, Membership, MembershipListParams, Message, MessageListParams, Organization, Person, Room, RoomListParams,
-        Team,
+        AttachmentAction, Membership, MembershipListParams, Message, MessageListParams,
+        Organization, Person, Room, RoomListParams, Team,
     };
 
     /// Trait for API types. Has to be public due to trait bounds limitations on webex API, but hidden
@@ -686,7 +686,7 @@ impl Event {
             "janus.user_sessions" => ActivityType::Janus,
             //"apheleia.subscription_update" ??
             e => {
-                log::debug!("Unknown data.event_type `{}`, returning Unknown", e);
+                log::debug!("Unknown data.event_type `{e}`, returning Unknown");
                 ActivityType::Unknown(e.to_string())
             }
         }
@@ -804,8 +804,8 @@ pub enum GlobalIdType {
     AttachmentAction,
     /// Corresponds to the ID of a membership
     Membership,
-    /// This GlobalId represents the ID of something not currently recognised, any API requests
-    /// with this GlobalId will produce an error.
+    /// This `GlobalId` represents the ID of something not currently recognised, any API requests
+    /// with this `GlobalId` will produce an error.
     Unknown,
 }
 impl From<ActivityType> for GlobalIdType {
@@ -821,10 +821,7 @@ impl From<ActivityType> for GlobalIdType {
             ) => Self::Room,
             ActivityType::Unknown(_) => Self::Unknown,
             a => {
-                log::error!(
-                    "Failed to convert {:?} to GlobalIdType, this may cause errors later",
-                    a
-                );
+                log::error!("Failed to convert {a:?} to GlobalIdType, this may cause errors later");
                 Self::Unknown
             }
         }
@@ -1014,6 +1011,7 @@ pub struct MiscItem {
 }
 
 /// Alerting specified in received events.
+///
 /// TODO: may be missing some enum variants.
 /// ALSO TODO: figure out what this does. Best guess, it refers to what alerts (e.g. a
 /// notification) an event will generate.

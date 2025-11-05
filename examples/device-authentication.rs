@@ -7,9 +7,9 @@ const INTEGRATION_CLIENT_SECRET: &str = "INTEGRATION_CLIENT_SECRET";
 #[tokio::main]
 async fn main() {
     let client_id = env::var(INTEGRATION_CLIENT_ID)
-        .unwrap_or_else(|_| panic!("{} not specified in environment", INTEGRATION_CLIENT_ID));
+        .unwrap_or_else(|_| panic!("{INTEGRATION_CLIENT_ID} not specified in environment"));
     let client_secret = env::var(INTEGRATION_CLIENT_SECRET)
-        .unwrap_or_else(|_| panic!("{} not specified in environment", INTEGRATION_CLIENT_SECRET));
+        .unwrap_or_else(|_| panic!("{INTEGRATION_CLIENT_SECRET} not specified in environment"));
 
     let authenticator = DeviceAuthenticator::new(&client_id, &client_secret);
 
