@@ -67,8 +67,16 @@ mod api {
     }
 
     #[derive(crate::types::Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct ListResult<T> {
-        pub items: Vec<T>,
+        pub items: Option<Vec<T>>,
+        // Some API endpoints might return different field names
+        pub devices: Option<Vec<T>>,
+        // Handle error cases - allow dead_code since these are for future API error handling
+        #[allow(dead_code)]
+        pub message: Option<String>,
+        #[allow(dead_code)]
+        pub errors: Option<Vec<serde_json::Value>>,
     }
 }
 

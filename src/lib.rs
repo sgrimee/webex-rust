@@ -377,8 +377,8 @@ where {
             .host_prefix
             .get(url_trimmed)
             .map_or(REST_HOST_PREFIX, String::as_str);
-        let url = format!("{prefix}/{url}");
-        let mut request_builder = self.web_client.request(http_method, url);
+        let full_url = format!("{prefix}/{url}");
+        let mut request_builder = self.web_client.request(http_method, &full_url);
         if let Some(params) = params {
             request_builder = request_builder.query(&params);
         }
@@ -401,7 +401,59 @@ where {
             }
         }
         let res = request_builder.send().await?;
-        Ok(res.json().await?)
+        
+        // Check HTTP status first
+        let status = res.status();
+        if !status.is_success() {
+            let error_text = res.text().await?;
+            
+            // Try to parse as JSON error response first
+            if let Ok(json_error) = serde_json::from_str::<serde_json::Value>(&error_text) {
+                if let Some(message) = json_error.get("message").and_then(|m| m.as_str()) {
+                    // Team 404 errors are expected when user doesn't have access - log as debug
+                    if status == StatusCode::NOT_FOUND && 
+                       full_url.contains("/teams/") && 
+                       message.contains("Could not find teams") {
+                        debug!("HTTP {} error for {}: {} (expected when not a team member)", status.as_u16(), full_url, message);
+                    } else {
+                        warn!("HTTP {} error for {}: {}", status.as_u16(), full_url, message);
+                    }
+                    return Err(Error::StatusText(status, message.to_string()));
+                }
+            }
+            
+            // Handle HTML error pages (like 403 from device endpoints)
+            if error_text.starts_with("<!doctype html") || error_text.starts_with("<html") {
+                let clean_error = if error_text.contains("<title>") && error_text.contains("</title>") {
+                    // Extract title from HTML
+                    let start = error_text.find("<title>").unwrap() + 7;
+                    let end = error_text.find("</title>").unwrap();
+                    error_text[start..end].to_string()
+                } else {
+                    format!("HTTP {} - HTML error page returned", status.as_u16())
+                };
+                debug!("HTTP {} error for {}: {}", status.as_u16(), full_url, clean_error);
+                return Err(Error::StatusText(status, clean_error));
+            }
+            
+            // Fallback to generic HTTP error
+            debug!("HTTP {} error for {}: {}", status.as_u16(), full_url, error_text);
+            return Err(Error::StatusText(status, error_text));
+        }
+        
+        // Get response text for successful responses
+        let response_text = res.text().await?;
+        debug!("API Response for {}: {}", full_url, response_text);
+        
+        // Parse the response
+        match serde_json::from_str(&response_text) {
+            Ok(parsed) => Ok(parsed),
+            Err(e) => {
+                error!("Failed to parse API response for {}: {}", full_url, e);
+                error!("Raw response: {}", response_text);
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -529,7 +581,19 @@ impl Webex {
         }
 
         // Failed to connect to any existing devices, creating new one
-        connect_device(self, self.setup_devices().await?).await
+        match self.setup_devices().await {
+            Ok(device) => connect_device(self, device).await,
+            Err(e) => match &e {
+                Error::StatusText(status, _) if *status == StatusCode::FORBIDDEN => {
+                    debug!("Device creation returned 403 - may need spark:devices_write scope in integration");
+                    Err(e)
+                }
+                _ => {
+                    error!("Failed to setup devices: {e}");
+                    Err(e)
+                }
+            }
+        }
     }
 
     async fn get_mercury_url(&self) -> Result<String, Option<error::Error>> {
@@ -565,7 +629,18 @@ impl Webex {
         //
         // 4. Add caching because this doesn't change, and it can be slow
 
-        let orgs = self.list::<Organization>().await?;
+        let orgs = match self.list::<Organization>().await {
+            Ok(orgs) => orgs,
+            Err(e) => {
+                let error_msg = e.to_string();
+                if error_msg.contains("missing required scopes") || error_msg.contains("missing required roles") {
+                    debug!("Insufficient permissions to list organizations, falling back to default mercury URL");
+                    return Err("Can't get mercury URL with insufficient organization permissions".into());
+                } else {
+                    return Err(e);
+                }
+            }
+        };
         if orgs.is_empty() {
             return Err("Can't get mercury URL with no orgs".into());
         }
@@ -646,7 +721,11 @@ impl Webex {
             .collect();
         let teams_rooms = try_join_all(futures).await?;
         for room in teams_rooms {
-            all_rooms.extend(room.items);
+            all_rooms.extend(
+                room.items
+                    .or(room.devices)
+                    .unwrap_or_else(Vec::new)
+            );
         }
         Ok(all_rooms)
     }
@@ -759,7 +838,11 @@ impl Webex {
                 AuthorizationType::Bearer(&self.token),
             )
             .await
-            .map(|result| result.items)
+            .map(|result| {
+                result.items
+                    .or(result.devices)
+                    .unwrap_or_else(Vec::new)
+            })
     }
 
     /// List resources of a type, with parameters
@@ -774,7 +857,11 @@ impl Webex {
                 AuthorizationType::Bearer(&self.token),
             )
             .await
-            .map(|result| result.items)
+            .map(|result| {
+                result.items
+                    .or(result.devices)
+                    .unwrap_or_else(Vec::new)
+            })
     }
 
     /// Get the current user's ID, caching it for future calls
@@ -879,12 +966,25 @@ impl Webex {
                     if s == StatusCode::NOT_FOUND {
                         debug!("No devices found, creating new one");
                         self.setup_devices().await.map(|device| vec![device])
+                    } else if s == StatusCode::FORBIDDEN {
+                        debug!("Device endpoint returned 403 Forbidden - expected for third-party integrations, creating new device");
+                        match self.setup_devices().await {
+                            Ok(device) => Ok(vec![device]),
+                            Err(setup_err) => {
+                                debug!("Setup devices also failed (expected): {setup_err}");
+                                // Return empty vec so event_stream can create a device via the fallback path
+                                Ok(vec![])
+                            }
+                        }
                     } else {
                         Err(e)
                     }
                 }
                 Error::Limited(_, _) => Err(e),
-                _ => Err(format!("Can't decode devices reply: {e}").into()),
+                _ => {
+                    error!("Can't decode devices reply: {e}");
+                    Err(format!("Can't decode devices reply: {e}").into())
+                }
             },
         }
     }
