@@ -140,10 +140,15 @@ impl DecryptionService {
         debug!("Fetching decryption key from KMS: {kms_url}");
 
         // The KMS URL format is kms://kms-cisco.wbx2.com/keys/{key_id}
-        // We need to convert this to an HTTPS URL
-        let https_url = kms_url
-            .replace("kms://", "https://")
-            .replace("/keys/", "/encryption/api/v1/keys/");
+        // But the actual HTTP endpoint is at encryption-a.wbx2.com
+        // Extract the key ID and construct the proper HTTPS URL
+        let key_id = kms_url
+            .split("/keys/")
+            .nth(1)
+            .ok_or_else(|| Error::from("Invalid KMS URL: missing key ID"))?;
+
+        // Use the encryption service endpoint instead of kms-cisco.wbx2.com
+        let https_url = format!("https://encryption-a.wbx2.com/encryption/api/v1/keys/{key_id}");
 
         debug!("Converted KMS URL to HTTPS: {https_url}");
 
