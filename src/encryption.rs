@@ -50,8 +50,8 @@ impl EncryptedContent {
             return Err("Invalid JWE token: no parts found".into());
         }
 
-        // Decode the header (first part)
-        let header_bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+        // Decode the header (first part) - uses base64url encoding per JWE spec
+        let header_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(parts[0])
             .map_err(|e| format!("Failed to decode JWE header: {e}"))?;
 
@@ -79,24 +79,25 @@ impl EncryptedContent {
             return Err(format!("Invalid JWE token: expected 5 parts, got {}", parts.len()).into());
         }
 
+        // JWE uses base64url encoding (not standard base64)
         let encrypted_key = if parts[1].is_empty() {
             // Direct key agreement uses empty encrypted_key
             Vec::new()
         } else {
-            base64::engine::general_purpose::STANDARD_NO_PAD
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(parts[1])
                 .map_err(|e| format!("Failed to decode encrypted key: {e}"))?
         };
 
-        let iv = base64::engine::general_purpose::STANDARD_NO_PAD
+        let iv = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(parts[2])
             .map_err(|e| format!("Failed to decode IV: {e}"))?;
 
-        let ciphertext = base64::engine::general_purpose::STANDARD_NO_PAD
+        let ciphertext = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(parts[3])
             .map_err(|e| format!("Failed to decode ciphertext: {e}"))?;
 
-        let tag = base64::engine::general_purpose::STANDARD_NO_PAD
+        let tag = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(parts[4])
             .map_err(|e| format!("Failed to decode authentication tag: {e}"))?;
 
