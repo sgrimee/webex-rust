@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 /// Represents a JWE (JSON Web Encryption) token header
 #[derive(Debug, Deserialize, Serialize)]
-struct JweHeader {
+pub struct JweHeader {
     /// Algorithm used for key encryption/agreement
     alg: String,
     /// Key ID pointing to the KMS key
@@ -212,7 +212,11 @@ impl DecryptionService {
         let cipher = Aes256Gcm::new_from_slice(key)
             .map_err(|e| format!("Failed to create cipher: {e}"))?;
 
-        let nonce = Nonce::from_slice(iv);
+        // IV must be exactly 12 bytes for AES-GCM
+        let iv_array: [u8; 12] = iv
+            .try_into()
+            .map_err(|_| format!("IV must be exactly 12 bytes, got {}", iv.len()))?;
+        let nonce = Nonce::from(iv_array);
 
         let payload = Payload {
             msg: &ciphertext_with_tag,
@@ -220,7 +224,7 @@ impl DecryptionService {
         };
 
         let plaintext = cipher
-            .decrypt(nonce, payload)
+            .decrypt(&nonce, payload)
             .map_err(|e| format!("Decryption failed: {e}"))?;
 
         Ok(plaintext)
