@@ -534,6 +534,8 @@ pub enum ActivityType {
     Message(MessageActivity),
     /// The space the bot is in has changed - see [`SpaceActivity`] for details.
     Space(SpaceActivity),
+    /// Reaction added or removed - see [`ReactionActivity`] for details.
+    Reaction(ReactionActivity),
     /// The user has submitted an [`AdaptiveCard`].
     AdaptiveCardSubmit,
     /// Meeting event.
@@ -553,6 +555,15 @@ pub enum ActivityType {
     /// `"conversation.activity.{event.data.activity.verb}"`, for example it would be
     /// `"conversation.activity.post"` for `Message(MessageActivity::Posted)`
     Unknown(String),
+}
+
+/// Specifics of what type of activity [`ActivityType::Reaction`] represents.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReactionActivity {
+    /// A reaction was added to a message
+    Added,
+    /// A reaction was removed from a message
+    Removed,
 }
 
 /// Specifics of what type of activity [`ActivityType::Message`] represents.
@@ -582,8 +593,7 @@ pub enum SpaceActivity {
     Created,
     /// A space was favorited
     Favorite,
-    /// Bot was added to a space... or a reaction was added to a message?
-    /// TODO: figure out a way to tell these events apart
+    /// Bot was added to a space (not a reaction - use ActivityType::Reaction for that)
     Joined,
     /// Bot left (was kicked out of) a space
     Left,
@@ -651,13 +661,27 @@ impl Event {
     pub fn activity_type(&self) -> ActivityType {
         match self.data.event_type.as_str() {
             "conversation.activity" => {
-                let activity_type = self
+                let activity = self
                     .data
                     .activity
                     .as_ref()
-                    .expect("Conversation activity should have activity set")
-                    .verb
-                    .as_str();
+                    .expect("Conversation activity should have activity set");
+
+                let activity_type = activity.verb.as_str();
+                let object_type = activity.object.object_type.as_str();
+
+                // Check if this is a reaction event (object_type == "reaction2")
+                if object_type == "reaction2" {
+                    return match activity_type {
+                        "add" => ActivityType::Reaction(ReactionActivity::Added),
+                        "delete" | "remove" => ActivityType::Reaction(ReactionActivity::Removed),
+                        _ => {
+                            log::warn!("Unknown reaction verb: {activity_type}");
+                            ActivityType::Unknown(format!("conversation.activity.reaction.{activity_type}"))
+                        }
+                    };
+                }
+
                 #[allow(clippy::option_if_let_else)]
                 match activity_type {
                     // TODO: This probably has more options
@@ -819,6 +843,7 @@ impl From<ActivityType> for GlobalIdType {
                 | SpaceActivity::Joined
                 | SpaceActivity::Left,
             ) => Self::Room,
+            ActivityType::Reaction(_) => Self::Message, // Reactions reference messages
             ActivityType::Unknown(_) => Self::Unknown,
             a => {
                 log::error!("Failed to convert {a:?} to GlobalIdType, this may cause errors later");
