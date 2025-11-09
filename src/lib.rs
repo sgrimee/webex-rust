@@ -594,6 +594,12 @@ impl Webex {
         }
     }
 
+    /// Get the access token used by this Webex client
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     /// Get an event stream handle
     pub async fn event_stream(&self) -> Result<WebexEventStream, Error> {
         // Helper function to connect to a device
