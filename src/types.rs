@@ -168,6 +168,72 @@ pub struct Team {
     pub description: Option<String>,
 }
 
+/// Room with read status information
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomWithReadStatus {
+    /// The room information
+    #[serde(flatten)]
+    pub room: Room,
+    /// The read status for this room
+    pub read_status: ReadStatus,
+}
+
+/// Read status information for a room
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadStatus {
+    /// The ID of the last message that was read in this room
+    /// Available when updating via PUT /memberships/{id} with lastSeenId
+    pub last_seen_id: Option<String>,
+    /// The date when the user last viewed this room
+    /// This field may not be available from the REST API directly
+    pub last_seen_date: Option<String>,
+    /// The ID of the last activity in the room
+    pub last_activity_id: Option<String>,
+    /// Whether the room has unread messages
+    /// Calculated by comparing last_activity with last_seen_date
+    pub has_unread: bool,
+}
+
+impl ReadStatus {
+    /// Create a ReadStatus from a Room, marking it as unread by default
+    /// since we don't have last_seen_date from the REST API
+    #[must_use]
+    pub fn from_room(_room: &Room) -> Self {
+        Self {
+            last_seen_id: None,
+            last_seen_date: None,
+            last_activity_id: None,
+            // Without last_seen_date, we can't determine if there are unread messages
+            // So we default to false (conservative approach)
+            has_unread: false,
+        }
+    }
+
+    /// Update the read status based on last_seen information
+    /// Returns true if the room has unread messages
+    #[must_use]
+    pub fn calculate_has_unread(&self, last_activity: &str) -> bool {
+        if let Some(last_seen) = &self.last_seen_date {
+            // If last_activity > last_seen_date, there are unread messages
+            last_activity > last_seen.as_str()
+        } else {
+            // Without last_seen_date, we can't determine unread status
+            false
+        }
+    }
+
+    /// Mark this room as read by setting the last_seen_date to the current time
+    pub fn mark_as_read(&mut self, last_message_id: Option<String>) {
+        self.last_seen_date = Some(chrono::Utc::now().to_rfc3339());
+        if let Some(id) = last_message_id {
+            self.last_seen_id = Some(id);
+        }
+        self.has_unread = false;
+    }
+}
+
 /// Webex Teams membership information
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Membership {
@@ -194,16 +260,26 @@ pub struct Membership {
     /// Whether or not the participant is a monitor of the room.
     #[serde(rename = "isMonitor")]
     pub is_monitor: bool,
+    /// Whether or not the direct space is hidden in the Webex clients.
+    #[serde(rename = "isRoomHidden")]
+    pub is_room_hidden: Option<bool>,
+    /// The room type (direct or group)
+    #[serde(rename = "type")]
+    pub room_type: Option<String>,
+    /// The date and time when the room was last read by the participant.
+    #[serde(rename = "lastSeenId")]
+    pub last_seen_id: Option<String>,
     /// The date and time when the membership was created.
     pub created: String,
 }
+
 
 #[skip_serializing_none]
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 /// Parameters for listing memberships
 pub struct MembershipListParams<'a> {
-    /// List memberships for a room, by ID.
+    /// List memberships in a room, by ID.
     pub room_id: Option<&'a str>,
     /// List memberships for a person, by ID.
     pub person_id: Option<&'a str>,
@@ -214,6 +290,19 @@ pub struct MembershipListParams<'a> {
     pub max: Option<u32>,
 }
 
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Parameters for updating a membership
+pub struct MembershipUpdateParams<'a> {
+    /// Whether or not the participant is a room moderator.
+    pub is_moderator: Option<bool>,
+    /// Whether or not the direct space is hidden in the Webex clients.
+    pub is_room_hidden: Option<bool>,
+    /// The ID of the last message read by the user.
+    /// This field is used to mark messages as read.
+    pub last_seen_id: Option<&'a str>,
+}
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CatalogReply {
@@ -534,6 +623,8 @@ pub enum ActivityType {
     Message(MessageActivity),
     /// The space the bot is in has changed - see [`SpaceActivity`] for details.
     Space(SpaceActivity),
+    /// Membership changed - see [`MembershipActivity`] for details.
+    Membership(MembershipActivity),
     /// The user has submitted an [`AdaptiveCard`].
     AdaptiveCardSubmit,
     /// Meeting event.
@@ -600,6 +691,21 @@ pub enum SpaceActivity {
     /// Space became unmoderated
     Unlocked,
 }
+
+/// Specifics of what type of activity [`ActivityType::Membership`] represents.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MembershipActivity {
+    /// A user marked messages as read (read receipt sent)
+    /// This event includes lastSeenId with the ID of the last message read
+    Seen,
+    /// A membership was created (user added to room)
+    Created,
+    /// A membership was updated
+    Updated,
+    /// A membership was deleted (user removed from room)
+    Deleted,
+}
+
 impl TryFrom<&str> for MessageActivity {
     type Error = ();
     fn try_from(s: &str) -> Result<Self, ()> {
@@ -631,6 +737,20 @@ impl TryFrom<&str> for SpaceActivity {
         }
     }
 }
+
+impl TryFrom<&str> for MembershipActivity {
+    type Error = ();
+    fn try_from(s: &str) -> Result<Self, ()> {
+        match s {
+            "seen" => Ok(Self::Seen),
+            "create" => Ok(Self::Created),
+            "update" => Ok(Self::Updated),
+            "delete" => Ok(Self::Deleted),
+            _ => Err(()),
+        }
+    }
+}
+
 impl MessageActivity {
     /// True if this is a new message ([`Self::Posted`] or [`Self::Shared`]).
     #[must_use]
@@ -671,6 +791,8 @@ impl Event {
                             ActivityType::Message(type_)
                         } else if let Ok(type_) = SpaceActivity::try_from(activity_type) {
                             ActivityType::Space(type_)
+                        } else if let Ok(type_) = MembershipActivity::try_from(activity_type) {
+                            ActivityType::Membership(type_)
                         } else {
                             log::error!(
                                 "Unknown activity type `{activity_type}`, returning Unknown"
