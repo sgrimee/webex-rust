@@ -13,6 +13,7 @@ Current functionality includes:
 - Monitoring an event stream
 - Sending direct or group messages
 - Getting room memberships
+- Marking messages as read or unread (syncs read status across all clients)
 - Building AdaptiveCards and retrieving responses
 
 Not all features are fully-fleshed out, particularly the AdaptiveCard
