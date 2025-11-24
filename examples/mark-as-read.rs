@@ -116,6 +116,14 @@ async fn main() {
                                     }
                                 }
                             }
+                            Some(_) => {
+                                // Send help message for unrecognized commands
+                                let mut reply = webex::types::MessageOut::from(&msg);
+                                reply.text = Some(format!(
+                                    "Hi! Send a message containing 'read' to mark it as read, or 'unread' to mark it as unread.\n\nExamples:\n- 'mark this as read'\n- 'set to unread'"
+                                ));
+                                webex.send_message(&reply).await.unwrap();
+                            }
                             None => {
                                 // Send help message
                                 let mut reply = webex::types::MessageOut::from(&msg);

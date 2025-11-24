@@ -75,8 +75,8 @@ async fn main() {
                     Ok(memberships) => {
                         println!("Found {} members:", memberships.len());
                         for membership in &memberships {
-                            println!("\n  Member: {}", membership.person_display_name);
-                            println!("    Email: {}", membership.person_email);
+                            println!("\n  Member: {}", membership.person_display_name.as_deref().unwrap_or("Unknown"));
+                            println!("    Email: {}", membership.person_email.as_deref().unwrap_or("Unknown"));
                             println!("    Moderator: {}", membership.is_moderator);
                             println!("    Created: {}", membership.created);
                         }
