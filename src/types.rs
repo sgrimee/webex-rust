@@ -3,6 +3,7 @@
 
 use crate::{adaptive_card::AdaptiveCard, error};
 use base64::Engine;
+
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::convert::TryFrom;
@@ -14,8 +15,8 @@ pub(crate) use api::{Gettable, ListResult};
 mod api {
     //! Private crate to hold all types that the user shouldn't have to interact with.
     use super::{
-        AttachmentAction, Message, MessageListParams, Organization, Person, Room, RoomListParams,
-        Team,
+        AttachmentAction, Membership, MembershipListParams, Message, MessageListParams,
+        Organization, Person, Room, RoomListParams, Team,
     };
 
     /// Trait for API types. Has to be public due to trait bounds limitations on webex API, but hidden
@@ -60,9 +61,22 @@ mod api {
         type ListParams<'a> = Option<Infallible>;
     }
 
+    impl Gettable for Membership {
+        const API_ENDPOINT: &'static str = "memberships";
+        type ListParams<'a> = MembershipListParams<'a>;
+    }
+
     #[derive(crate::types::Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct ListResult<T> {
-        pub items: Vec<T>,
+        pub items: Option<Vec<T>>,
+        // Some API endpoints might return different field names
+        pub devices: Option<Vec<T>>,
+        // Handle error cases - allow dead_code since these are for future API error handling
+        #[allow(dead_code)]
+        pub message: Option<String>,
+        #[allow(dead_code)]
+        pub errors: Option<Vec<serde_json::Value>>,
     }
 }
 
@@ -152,6 +166,52 @@ pub struct Team {
     pub created: String,
     /// Team description
     pub description: Option<String>,
+}
+
+/// Webex Teams membership information
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Membership {
+    /// A unique identifier for the membership.
+    pub id: String,
+    /// The room ID associated with this membership.
+    #[serde(default, rename = "roomId")]
+    pub room_id: String,
+    /// The person ID associated with this membership.
+    #[serde(default, rename = "personId")]
+    pub person_id: String,
+    /// The email address of the person.
+    #[serde(rename = "personEmail")]
+    pub person_email: Option<String>,
+    /// The display name of the person.
+    #[serde(rename = "personDisplayName")]
+    pub person_display_name: Option<String>,
+    /// The organization ID of the person.
+    #[serde(rename = "personOrgId")]
+    pub person_org_id: Option<String>,
+    /// Whether or not the participant is a moderator of the room.
+    #[serde(rename = "isModerator")]
+    pub is_moderator: bool,
+    /// Whether or not the participant is a monitor of the room.
+    #[serde(rename = "isMonitor")]
+    pub is_monitor: bool,
+    /// The date and time when the membership was created.
+    pub created: String,
+}
+
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Parameters for listing memberships
+pub struct MembershipListParams<'a> {
+    /// List memberships for a room, by ID.
+    pub room_id: Option<&'a str>,
+    /// List memberships for a person, by ID.
+    pub person_id: Option<&'a str>,
+    /// List memberships for a person, by email address.
+    pub person_email: Option<&'a str>,
+    /// Limit the maximum number of memberships in the response.
+    /// Default: 100
+    pub max: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -336,6 +396,7 @@ pub struct MessageEditParams<'a> {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[allow(dead_code)]
 pub(crate) struct EmptyReply {}
 
 /// API Error
@@ -612,8 +673,7 @@ impl Event {
                             ActivityType::Space(type_)
                         } else {
                             log::error!(
-                                "Unknown activity type `{}`, returning Unknown",
-                                activity_type
+                                "Unknown activity type `{activity_type}`, returning Unknown"
                             );
                             ActivityType::Unknown(format!("conversation.activity.{activity_type}"))
                         }
@@ -626,7 +686,7 @@ impl Event {
             "janus.user_sessions" => ActivityType::Janus,
             //"apheleia.subscription_update" ??
             e => {
-                log::debug!("Unknown data.event_type `{}`, returning Unknown", e);
+                log::debug!("Unknown data.event_type `{e}`, returning Unknown");
                 ActivityType::Unknown(e.to_string())
             }
         }
@@ -668,8 +728,8 @@ impl Event {
             ActivityType::Space(SpaceActivity::Created) => self.room_id_of_space_created_event()?,
             ActivityType::Space(
                 SpaceActivity::Changed | SpaceActivity::Joined | SpaceActivity::Left,
-            ) => Self::target_global_id(activity)?,
-            ActivityType::Message(MessageActivity::Deleted) => Self::target_global_id(activity)?,
+            )
+            | ActivityType::Message(MessageActivity::Deleted) => Self::target_global_id(activity)?,
             _ => activity.id.clone(),
         };
         Ok(GlobalId::new_with_cluster_unchecked(
@@ -742,6 +802,8 @@ pub enum GlobalIdType {
     Team,
     /// Retrieves a specific attachment
     AttachmentAction,
+    /// Corresponds to the ID of a membership
+    Membership,
     /// This `GlobalId` represents the ID of something not currently recognised, any API requests
     /// with this `GlobalId` will produce an error.
     Unknown,
@@ -759,10 +821,7 @@ impl From<ActivityType> for GlobalIdType {
             ) => Self::Room,
             ActivityType::Unknown(_) => Self::Unknown,
             a => {
-                log::error!(
-                    "Failed to convert {:?} to GlobalIdType, this may cause errors later",
-                    a
-                );
+                log::error!("Failed to convert {a:?} to GlobalIdType, this may cause errors later");
                 Self::Unknown
             }
         }
@@ -779,6 +838,7 @@ impl std::fmt::Display for GlobalIdType {
                 Self::Room => "ROOM",
                 Self::Team => "TEAM",
                 Self::AttachmentAction => "ATTACHMENT_ACTION",
+                Self::Membership => "MEMBERSHIP",
                 Self::Unknown => "<UNKNOWN>",
             }
         )
@@ -951,6 +1011,7 @@ pub struct MiscItem {
 }
 
 /// Alerting specified in received events.
+///
 /// TODO: may be missing some enum variants.
 /// ALSO TODO: figure out what this does. Best guess, it refers to what alerts (e.g. a
 /// notification) an event will generate.
@@ -1032,18 +1093,20 @@ pub struct Person {
     /// The email addresses of the person.
     pub emails: Vec<String>,
     /// Phone numbers for the person.
-    pub phone_numbers: Vec<PhoneNumber>,
+    pub phone_numbers: Option<Vec<PhoneNumber>>,
     /// The full name of the person.
+    #[serde(rename = "displayName")]
     pub display_name: String,
     /// The nickname of the person if configured. If no nickname is configured for the person, this field will not be present.
-    pub nick_name: String,
+    pub nick_name: Option<String>,
     /// The first name of the person.
-    pub first_name: String,
+    pub first_name: Option<String>,
     /// The last name of the person.
-    pub last_name: String,
+    pub last_name: Option<String>,
     /// The URL to the person's avatar in PNG format.
-    pub avatar: String,
+    pub avatar: Option<String>,
     /// The ID of the organization to which this person belongs.
+    #[serde(rename = "orgId")]
     pub org_id: String,
     /// The date and time the person was created.
     pub created: String,
@@ -1161,7 +1224,7 @@ mod tests {
             event.room_id_of_space_created_event().unwrap(),
             "1ab849e0-9ab4-11ee-a70f-d9b57e49f8bf"
         );
-        // invalid UUID (assumed base64) should return itself unmodified
+        // invalid UUID (assumed base64) should not be changed
         event.data.activity = Some(Activity {
             verb: "create".to_string(),
             id: "bogus".to_string(),

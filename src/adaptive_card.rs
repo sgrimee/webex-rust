@@ -102,14 +102,12 @@ impl AdaptiveCard {
 }
 
 impl From<&Self> for AdaptiveCard {
-    #[must_use]
     fn from(item: &Self) -> Self {
         item.clone()
     }
 }
 
 impl From<&mut Self> for AdaptiveCard {
-    #[must_use]
     fn from(item: &mut Self) -> Self {
         item.clone()
     }
@@ -476,14 +474,12 @@ pub enum CardElement {
 }
 
 impl From<&Self> for CardElement {
-    #[must_use]
     fn from(item: &Self) -> Self {
         item.clone()
     }
 }
 
 impl From<&mut Self> for CardElement {
-    #[must_use]
     fn from(item: &mut Self) -> Self {
         item.clone()
     }
@@ -859,14 +855,12 @@ pub struct Column {
 }
 
 impl From<&Self> for Column {
-    #[must_use]
     fn from(item: &Self) -> Self {
         item.clone()
     }
 }
 
 impl From<&mut Self> for Column {
-    #[must_use]
     fn from(item: &mut Self) -> Self {
         item.clone()
     }
@@ -1034,10 +1028,15 @@ pub enum FontType {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Size {
+    #[serde(alias = "Default")]
     Default,
+    #[serde(alias = "Small")]
     Small,
+    #[serde(alias = "Medium")]
     Medium,
+    #[serde(alias = "Large")]
     Large,
+    #[serde(alias = "ExtraLarge")]
     ExtraLarge,
 }
 
@@ -1046,10 +1045,15 @@ pub enum Size {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ImageSize {
+    #[serde(alias = "Auto")]
     Auto,
+    #[serde(alias = "Stretch")]
     Stretch,
+    #[serde(alias = "Small")]
     Small,
+    #[serde(alias = "Medium")]
     Medium,
+    #[serde(alias = "Large")]
     Large,
 }
 

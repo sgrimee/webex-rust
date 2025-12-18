@@ -53,7 +53,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     hash::{self, Hasher},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::net::TcpStream;
@@ -97,6 +97,8 @@ pub struct Webex {
     token: String,
     /// Webex Device Information used for device registration
     pub device: DeviceData,
+    /// Cached user ID to avoid repeated /people/me calls
+    user_id: Arc<Mutex<Option<String>>>,
 }
 
 /// Webex Event Stream handler
@@ -131,7 +133,7 @@ impl WebexEventStream {
                 }
                 // Didn't time out
                 Ok(next_result) => match next_result {
-                    None => continue,
+                    None => {}
                     Some(msg) => match msg {
                         Ok(msg) => {
                             if let Some(h_msg) = self.handle_message(msg)? {
@@ -147,7 +149,10 @@ impl WebexEventStream {
                             return Err(msg.unwrap_err().to_string().into());
                         }
                         Err(e) => {
-                            return Err(Error::Tungstenite(e, "Error getting next_result".into()))
+                            return Err(Error::Tungstenite(
+                                Box::new(e),
+                                "Error getting next_result".into(),
+                            ))
                         }
                     },
                 },
@@ -168,7 +173,7 @@ impl WebexEventStream {
                 }
             }
             TMessage::Text(t) => {
-                debug!("text: {}", t);
+                debug!("text: {t}");
                 Ok(None)
             }
             TMessage::Ping(_) => {
@@ -176,7 +181,7 @@ impl WebexEventStream {
                 Ok(None)
             }
             TMessage::Close(t) => {
-                debug!("close: {:?}", t);
+                debug!("close: {t:?}");
                 self.is_open = false;
                 Err(Error::Closed("Web Socket Closed".to_string()))
             }
@@ -220,7 +225,7 @@ impl WebexEventStream {
                 }
             }
             Err(e) => Err(Error::Tungstenite(
-                e,
+                Box::new(e),
                 "failed to send authentication".to_string(),
             )),
         }
@@ -264,38 +269,58 @@ impl RestClient {
      * high-level calls like "get_message"
      ******************************************************************/
 
-    async fn api_get<'a, T: DeserializeOwned>(
+    async fn api_get<T: DeserializeOwned>(
         &self,
         rest_method: &str,
         params: Option<impl Serialize>,
-        auth: AuthorizationType<'a>,
+        auth: AuthorizationType<'_>,
     ) -> Result<T, Error> {
         self.rest_api(reqwest::Method::GET, rest_method, auth, params, BODY_NONE)
             .await
     }
 
-    async fn api_delete<'a>(
+    async fn api_delete(
         &self,
         rest_method: &str,
         params: Option<impl Serialize>,
-        auth: AuthorizationType<'a>,
+        auth: AuthorizationType<'_>,
     ) -> Result<(), Error> {
-        self.rest_api(
-            reqwest::Method::DELETE,
-            rest_method,
-            auth,
-            params,
-            BODY_NONE,
-        )
-        .await
+        let url_trimmed = rest_method.split('?').next().unwrap_or(rest_method);
+        let prefix = self
+            .host_prefix
+            .get(url_trimmed)
+            .map_or(REST_HOST_PREFIX, String::as_str);
+        let url = format!("{prefix}/{rest_method}");
+        let mut request_builder = self.web_client.request(reqwest::Method::DELETE, url);
+        if let Some(params) = params {
+            request_builder = request_builder.query(&params);
+        }
+        match auth {
+            AuthorizationType::None => {}
+            AuthorizationType::Bearer(token) => {
+                request_builder = request_builder.bearer_auth(token);
+            }
+            AuthorizationType::Basic { username, password } => {
+                request_builder = request_builder.basic_auth(username, Some(password));
+            }
+        }
+        let res = request_builder.send().await?;
+
+        // Check for success status codes (200-299) - DELETE often returns 204 No Content
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            // Convert non-success responses to errors
+            Err(Error::from(res.error_for_status().unwrap_err()))
+        }
     }
 
-    async fn api_post<'a, T: DeserializeOwned>(
+    async fn api_post<T: DeserializeOwned>(
         &self,
         rest_method: &str,
         body: impl Serialize,
         params: Option<impl Serialize>,
-        auth: AuthorizationType<'a>,
+        auth: AuthorizationType<'_>,
     ) -> Result<T, Error>
 where {
         self.rest_api(
@@ -308,12 +333,12 @@ where {
         .await
     }
 
-    async fn api_post_form_urlencoded<'a, T: DeserializeOwned>(
+    async fn api_post_form_urlencoded<T: DeserializeOwned>(
         &self,
         rest_method: &str,
         body: impl Serialize,
         params: Option<impl Serialize>,
-        auth: AuthorizationType<'a>,
+        auth: AuthorizationType<'_>,
     ) -> Result<T, Error> {
         self.rest_api(
             reqwest::Method::POST,
@@ -325,12 +350,12 @@ where {
         .await
     }
 
-    async fn api_put<'a, T: DeserializeOwned>(
+    async fn api_put<T: DeserializeOwned>(
         &self,
         rest_method: &str,
         body: impl Serialize,
         params: Option<impl Serialize>,
-        auth: AuthorizationType<'a>,
+        auth: AuthorizationType<'_>,
     ) -> Result<T, Error> {
         self.rest_api(
             reqwest::Method::PUT,
@@ -355,8 +380,8 @@ where {
             .host_prefix
             .get(url_trimmed)
             .map_or(REST_HOST_PREFIX, String::as_str);
-        let url = format!("{prefix}/{url}");
-        let mut request_builder = self.web_client.request(http_method, url);
+        let full_url = format!("{prefix}/{url}");
+        let mut request_builder = self.web_client.request(http_method, &full_url);
         if let Some(params) = params {
             request_builder = request_builder.query(&params);
         }
@@ -379,7 +404,90 @@ where {
             }
         }
         let res = request_builder.send().await?;
-        Ok(res.json().await?)
+
+        // Check HTTP status first
+        let status = res.status();
+        if !status.is_success() {
+            let error_text = res.text().await?;
+
+            // Try to parse as JSON error response first
+            if let Ok(json_error) = serde_json::from_str::<serde_json::Value>(&error_text) {
+                if let Some(message) = json_error.get("message").and_then(|m| m.as_str()) {
+                    // Team 404 errors are expected when user doesn't have access - log as debug
+                    if status == StatusCode::NOT_FOUND
+                        && full_url.contains("/teams/")
+                        && message.contains("Could not find teams")
+                    {
+                        debug!(
+                            "HTTP {} error for {}: {} (expected when not a team member)",
+                            status.as_u16(),
+                            full_url,
+                            message
+                        );
+                    } else {
+                        warn!(
+                            "HTTP {} error for {}: {}",
+                            status.as_u16(),
+                            full_url,
+                            message
+                        );
+                    }
+                    return Err(Error::StatusText(status, message.to_string()));
+                }
+            }
+
+            // Handle HTML error pages (like 403 from device endpoints)
+            if error_text.starts_with("<!doctype html") || error_text.starts_with("<html") {
+                let clean_error =
+                    if error_text.contains("<title>") && error_text.contains("</title>") {
+                        // Extract title from HTML
+                        let start = error_text.find("<title>").unwrap() + 7;
+                        let end = error_text.find("</title>").unwrap();
+                        error_text[start..end].to_string()
+                    } else {
+                        format!("HTTP {} - HTML error page returned", status.as_u16())
+                    };
+                debug!(
+                    "HTTP {} error for {}: {}",
+                    status.as_u16(),
+                    full_url,
+                    clean_error
+                );
+                return Err(Error::StatusText(status, clean_error));
+            }
+
+            // Fallback to generic HTTP error
+            // Device/mercury endpoints returning 403 indicate missing OAuth scopes
+            if status.as_u16() == 403
+                && (full_url.contains("u2c.wbx2.com") || full_url.contains("wdm"))
+            {
+                error!(
+                    "HTTP 403 for {full_url}: {error_text} - likely missing required OAuth scopes"
+                );
+            } else {
+                error!(
+                    "HTTP {} error for {}: {}",
+                    status.as_u16(),
+                    full_url,
+                    error_text
+                );
+            }
+            return Err(Error::StatusText(status, error_text));
+        }
+
+        // Get response text for successful responses
+        let response_text = res.text().await?;
+        debug!("API Response for {full_url}: {response_text}");
+
+        // Parse the response
+        match serde_json::from_str(&response_text) {
+            Ok(parsed) => Ok(parsed),
+            Err(e) => {
+                error!("Failed to parse API response for {full_url}: {e}");
+                error!("Raw response: {response_text}");
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -423,16 +531,17 @@ impl Webex {
                 system_version: Some(CRATE_VERSION.to_string()),
                 ..DeviceData::default()
             },
+            user_id: Arc::new(Mutex::new(None)),
         };
 
         let devices_url = match webex.get_mercury_url().await {
             Ok(url) => {
-                trace!("Fetched mercury url {}", url);
+                trace!("Fetched mercury url {url}");
                 url
             }
             Err(e) => {
                 debug!("Failed to fetch devices url, falling back to default");
-                debug!("Error: {:?}", e);
+                debug!("Error: {e:?}");
                 DEFAULT_REGISTRATION_HOST_PREFIX.to_string()
             }
         };
@@ -456,10 +565,10 @@ impl Webex {
             };
             let url = url::Url::parse(ws_url.as_str())
                 .map_err(|_| Error::from("Failed to parse ws_url"))?;
-            debug!("Connecting to {:?}", url);
+            debug!("Connecting to {url:?}");
             match connect_async(url.as_str()).await {
                 Ok((mut ws_stream, _response)) => {
-                    debug!("Connected to {}", url);
+                    debug!("Connected to {url}");
                     WebexEventStream::auth(&mut ws_stream, &s.token).await?;
                     debug!("Authenticated");
                     let timeout = Duration::from_secs(20);
@@ -470,9 +579,9 @@ impl Webex {
                     })
                 }
                 Err(e) => {
-                    warn!("Failed to connect to {:?}: {:?}", url, e);
+                    warn!("Failed to connect to {url:?}: {e:?}");
                     Err(Error::Tungstenite(
-                        e,
+                        Box::new(e),
                         "Failed to connect to ws_url".to_string(),
                     ))
                 }
@@ -486,7 +595,7 @@ impl Webex {
             .await?
             .iter()
             .filter(|d| d.name == self.device.name)
-            .inspect(|d| trace!("Kept device: {}", d))
+            .inspect(|d| trace!("Kept device: {d}"))
             .cloned()
             .collect();
 
@@ -506,15 +615,26 @@ impl Webex {
         }
 
         // Failed to connect to any existing devices, creating new one
-        connect_device(self, self.setup_devices().await?).await
+        match self.setup_devices().await {
+            Ok(device) => connect_device(self, device).await,
+            Err(e) => match &e {
+                Error::StatusText(status, _) if *status == StatusCode::FORBIDDEN => {
+                    error!("Device creation failed with 403 - event stream REQUIRES spark:devices_write and spark:devices_read scopes in your Webex integration");
+                    Err(e)
+                }
+                _ => {
+                    error!("Failed to setup devices: {e}");
+                    Err(e)
+                }
+            },
+        }
     }
 
     async fn get_mercury_url(&self) -> Result<String, Option<error::Error>> {
         // Bit of a hacky workaround, error::Error does not implement clone
         // TODO: this can be fixed by returning a Result<String, &error::Error>
-        lazy_static::lazy_static! {
-            static ref MERCURY_CACHE: Mutex<HashMap<u64, Result<String, ()>>> = Mutex::new(HashMap::new());
-        }
+        static MERCURY_CACHE: std::sync::LazyLock<Mutex<HashMap<u64, Result<String, ()>>>> =
+            std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
         if let Ok(Some(result)) = MERCURY_CACHE
             .lock()
             .map(|cache| cache.get(&self.id).cloned())
@@ -542,7 +662,21 @@ impl Webex {
         //
         // 4. Add caching because this doesn't change, and it can be slow
 
-        let orgs = self.list::<Organization>().await?;
+        let orgs = match self.list::<Organization>().await {
+            Ok(orgs) => orgs,
+            Err(e) => {
+                let error_msg = e.to_string();
+                if error_msg.contains("missing required scopes")
+                    || error_msg.contains("missing required roles")
+                {
+                    debug!("Insufficient permissions to list organizations, falling back to default mercury URL");
+                    return Err(
+                        "Can't get mercury URL with insufficient organization permissions".into(),
+                    );
+                }
+                return Err(e);
+            }
+        };
         if orgs.is_empty() {
             return Err("Can't get mercury URL with no orgs".into());
         }
@@ -623,7 +757,7 @@ impl Webex {
             .collect();
         let teams_rooms = try_join_all(futures).await?;
         for room in teams_rooms {
-            all_rooms.extend(room.items);
+            all_rooms.extend(room.items.or(room.devices).unwrap_or_else(Vec::new));
         }
         Ok(all_rooms)
     }
@@ -736,7 +870,7 @@ impl Webex {
                 AuthorizationType::Bearer(&self.token),
             )
             .await
-            .map(|result| result.items)
+            .map(|result| result.items.or(result.devices).unwrap_or_default())
     }
 
     /// List resources of a type, with parameters
@@ -751,7 +885,110 @@ impl Webex {
                 AuthorizationType::Bearer(&self.token),
             )
             .await
-            .map(|result| result.items)
+            .map(|result| result.items.or(result.devices).unwrap_or_default())
+    }
+
+    /// Get the current user's ID, caching it for future calls
+    ///
+    /// # Errors
+    /// * [`Error::Limited`] - returned on HTTP 423/429 with an optional Retry-After.
+    /// * [`Error::Status`] | [`Error::StatusText`] - returned when the request results in a non-200 code.
+    /// * [`Error::Json`] - returned when input/output cannot be serialized/deserialized.
+    /// * [`Error::UTF8`] - returned when the request returns non-UTF8 code.
+    async fn get_user_id(&self) -> Result<String, Error> {
+        // Check if we already have the user ID cached
+        if let Ok(guard) = self.user_id.lock() {
+            if let Some(cached_id) = guard.as_ref() {
+                return Ok(cached_id.clone());
+            }
+        }
+
+        // Fetch the user ID from the API
+        let me_global_id = types::GlobalId::new_with_cluster_unchecked(
+            types::GlobalIdType::Person,
+            "me".to_string(),
+            None,
+        );
+        let me = self.get::<types::Person>(&me_global_id).await?;
+
+        // Cache it for future use
+        if let Ok(mut guard) = self.user_id.lock() {
+            *guard = Some(me.id.clone());
+        }
+
+        debug!("Cached user ID: {}", me.id);
+        Ok(me.id)
+    }
+
+    /// Leave a room by deleting the current user's membership
+    ///
+    /// # Arguments
+    /// * `room_id`: The ID of the room to leave
+    ///
+    /// # Errors
+    /// * [`Error::UserError`] - returned when attempting to leave a 1:1 direct room (not supported by Webex API)
+    /// * [`Error::Limited`] - returned on HTTP 423/429 with an optional Retry-After.
+    /// * [`Error::Status`] | [`Error::StatusText`] - returned when the request results in a non-200 code.
+    /// * [`Error::Json`] - returned when input/output cannot be serialized/deserialized.
+    /// * [`Error::UTF8`] - returned when the request returns non-UTF8 code.
+    ///
+    /// # Note
+    /// The Webex API does not support leaving or deleting 1:1 direct message rooms.
+    /// This function will return an error for direct rooms. Only group rooms can be left.
+    pub async fn leave_room(&self, room_id: &types::GlobalId) -> Result<(), Error> {
+        debug!("Leaving room: {}", room_id.id());
+
+        // First, get the room details to check if it's a direct room
+        let room = self.get::<types::Room>(room_id).await?;
+
+        // Check if this is a 1:1 direct room - these cannot be left via API
+        if room.room_type == "direct" {
+            return Err(error::Error::UserError(
+                "Cannot leave a 1:1 direct message room. The Webex API does not support leaving or hiding direct rooms. Only group rooms can be left.".to_string()
+            ));
+        }
+
+        // Get the current user ID (cached after first call)
+        let my_user_id = self.get_user_id().await?;
+        debug!("Current user ID: {my_user_id}");
+
+        // Get memberships in this room - we can use personId filter to get just our membership
+        let membership_params = types::MembershipListParams {
+            room_id: Some(room_id.id()),
+            person_id: Some(&my_user_id),
+            ..Default::default()
+        };
+
+        debug!("Fetching membership for user {my_user_id} in room");
+        let memberships = self
+            .list_with_params::<types::Membership>(membership_params)
+            .await?;
+
+        debug!("Found {} matching memberships", memberships.len());
+
+        let membership = memberships.into_iter().next().ok_or_else(|| {
+            error!("Could not find membership for user '{my_user_id}' in room");
+            error!(
+                "This usually means you are not a member of this room, or membership data is stale"
+            );
+            error::Error::UserError("User is not a member of this room".to_string())
+        })?;
+
+        debug!("Found membership with ID: {}", membership.id);
+        let membership_id =
+            types::GlobalId::new(types::GlobalIdType::Membership, membership.id.clone())?;
+        let rest_method = format!("memberships/{}", membership_id.id());
+
+        self.client
+            .api_delete(
+                &rest_method,
+                None::<()>,
+                AuthorizationType::Bearer(&self.token),
+            )
+            .await?;
+        debug!("Successfully left room: {}", room_id.id());
+
+        Ok(())
     }
 
     async fn get_devices(&self) -> Result<Vec<DeviceData>, Error> {
@@ -770,19 +1007,80 @@ impl Webex {
                 debug!("Chaining one-time device setup from devices query");
                 self.setup_devices().await.map(|device| vec![device])
             }
-            Err(e) => match e {
-                Error::Status(s) | Error::StatusText(s, _) => {
-                    if s == StatusCode::NOT_FOUND {
-                        debug!("No devices found, creating new one");
-                        self.setup_devices().await.map(|device| vec![device])
-                    } else {
-                        Err(e)
-                    }
-                }
-                Error::Limited(_, _) => Err(e),
-                _ => Err(format!("Can't decode devices reply: {e}").into()),
-            },
+            Err(e) => self.handle_get_devices_error(e).await,
         }
+    }
+
+    async fn handle_get_devices_error(&self, e: Error) -> Result<Vec<DeviceData>, Error> {
+        match e {
+            Error::Status(s) => self.handle_status_error(s).await,
+            Error::StatusText(s, msg) => self.handle_status_text_error(s, &msg).await,
+            Error::Limited(_, _) => Err(e),
+            _ => {
+                error!("Can't decode devices reply: {e}");
+                Err(format!("Can't decode devices reply: {e}").into())
+            }
+        }
+    }
+
+    async fn handle_status_error(&self, status: StatusCode) -> Result<Vec<DeviceData>, Error> {
+        if status == StatusCode::NOT_FOUND {
+            debug!("No devices found (404), will create new device");
+            self.setup_devices().await.map(|device| vec![device])
+        } else if status == StatusCode::FORBIDDEN {
+            self.handle_forbidden_error(None).await
+        } else {
+            error!("Unexpected HTTP status {status} when listing devices");
+            Err(Error::Status(status))
+        }
+    }
+
+    async fn handle_status_text_error(
+        &self,
+        status: StatusCode,
+        msg: &str,
+    ) -> Result<Vec<DeviceData>, Error> {
+        if status == StatusCode::NOT_FOUND {
+            debug!("No devices found (404), will create new device");
+            self.setup_devices().await.map(|device| vec![device])
+        } else if status == StatusCode::FORBIDDEN {
+            self.handle_forbidden_error(Some(msg)).await
+        } else {
+            error!("Unexpected HTTP status {status} when listing devices: {msg}");
+            Err(Error::StatusText(status, msg.to_string()))
+        }
+    }
+
+    async fn handle_forbidden_error(
+        &self,
+        details: Option<&str>,
+    ) -> Result<Vec<DeviceData>, Error> {
+        Self::log_forbidden_error(details);
+        match self.setup_devices().await {
+            Ok(device) => {
+                debug!("Surprisingly, device creation succeeded despite 403 on list");
+                Ok(vec![device])
+            }
+            Err(setup_err) => {
+                error!("Device creation also failed (expected): {setup_err}");
+                error!("Cannot proceed without device access");
+                Err(Error::Status(StatusCode::FORBIDDEN))
+            }
+        }
+    }
+
+    fn log_forbidden_error(details: Option<&str>) {
+        error!("========================================================================");
+        error!("Device endpoint returned 403 Forbidden");
+        error!("========================================================================");
+        error!("  Your Webex integration token is missing required OAuth scopes:");
+        error!("    - spark:devices_write  (required to register device)");
+        error!("    - spark:devices_read   (required to list devices)");
+        if let Some(msg) = details {
+            error!("");
+            error!("  Error details: {msg}");
+        }
+        error!("========================================================================");
     }
 
     async fn setup_devices(&self) -> Result<DeviceData, Error> {
@@ -866,5 +1164,361 @@ impl MessageOut {
             content: card,
         }]);
         self
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::significant_drop_tightening)]
+mod tests {
+    use super::*;
+    use mockito::ServerGuard;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Helper function to create a test Webex client with mocked `RestClient`
+    fn create_test_webex_client(server: &ServerGuard) -> Webex {
+        let mut host_prefix = HashMap::new();
+        host_prefix.insert("people/me".to_string(), server.url());
+        host_prefix.insert(
+            "rooms/Y2lzY29zcGFyazovL3VzL1JPT00vMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MDEy"
+                .to_string(),
+            server.url(),
+        );
+        host_prefix.insert("memberships".to_string(), server.url());
+        host_prefix.insert("memberships/Y2lzY29zcGFyazovL3VzL01FTUJFUlNISVAvODc2NTQzMjEtNDMyMS00MzIxLTQzMjEtMjEwOTg3NjU0MzIx".to_string(), server.url());
+
+        let rest_client = RestClient {
+            host_prefix,
+            web_client: reqwest::Client::new(),
+        };
+
+        let device = DeviceData {
+            url: Some("test_url".to_string()),
+            ws_url: Some("ws://test".to_string()),
+            device_name: Some("test_device".to_string()),
+            device_type: Some("DESKTOP".to_string()),
+            localized_model: Some("rust-sdk-test".to_string()),
+            modification_time: Some(chrono::Utc::now()),
+            model: Some("rust-sdk-test".to_string()),
+            name: Some(format!(
+                "rust-sdk-test-{}",
+                COUNTER.fetch_add(1, Ordering::SeqCst)
+            )),
+            system_name: Some("rust-sdk-test".to_string()),
+            system_version: Some("0.1.0".to_string()),
+        };
+
+        Webex {
+            id: 1,
+            client: rest_client,
+            token: "test_token".to_string(),
+            device,
+            user_id: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_leave_room_success() {
+        let mut server = mockito::Server::new_async().await;
+
+        // Mock the GET /rooms/{id} API call to check room type
+        let room_mock = server
+            .mock("GET", "/rooms/Y2lzY29zcGFyazovL3VzL1JPT00vMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MDEy")
+            .match_header("authorization", "Bearer test_token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({
+                "id": "Y2lzY29zcGFyazovL3VzL1JPT00vMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MDEy",
+                "title": "Test Room",
+                "type": "group",
+                "isLocked": false,
+                "lastActivity": "2024-01-01T00:00:00.000Z",
+                "creatorId": "test_person_id",
+                "created": "2024-01-01T00:00:00.000Z"
+            }).to_string())
+            .create_async()
+            .await;
+
+        // Mock the people/me API call
+        let people_mock = server
+            .mock("GET", "/people/me")
+            .match_header("authorization", "Bearer test_token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "id": "test_person_id",
+                    "emails": ["test@example.com"],
+                    "displayName": "Test User",
+                    "orgId": "test_org_id",
+                    "created": "2024-01-01T00:00:00.000Z",
+                    "lastActivity": "2024-01-01T00:00:00.000Z",
+                    "status": "active",
+                    "type": "person"
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        // Mock the membership list API call
+        let membership_mock = server
+            .mock("GET", "/memberships")
+            .match_header("authorization", "Bearer test_token")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "roomId".into(),
+                "Y2lzY29zcGFyazovL3VzL1JPT00vMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MDEy"
+                    .into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                "items": [{
+                    "id": "87654321-4321-4321-4321-210987654321",
+                    "roomId": "test_room_id",
+                    "personId": "test_person_id",
+                    "personEmail": "test@example.com",
+                    "personDisplayName": "Test User",
+                    "personOrgId": "test_org_id",
+                    "isModerator": false,
+                    "isMonitor": false,
+                    "created": "2024-01-01T00:00:00.000Z"
+                }]
+            }"#,
+            )
+            .create_async()
+            .await;
+
+        // Mock the membership deletion API call
+        let delete_mock = server
+            .mock("DELETE", "/memberships/Y2lzY29zcGFyazovL3VzL01FTUJFUlNISVAvODc2NTQzMjEtNDMyMS00MzIxLTQzMjEtMjEwOTg3NjU0MzIx")
+            .match_header("authorization", "Bearer test_token")
+            .with_status(204)
+            .with_body("")
+            .create_async()
+            .await;
+
+        let webex_client = create_test_webex_client(&server);
+        let room_id = types::GlobalId::new(
+            types::GlobalIdType::Room,
+            "12345678-1234-1234-1234-123456789012".to_string(),
+        )
+        .unwrap();
+
+        let result = webex_client.leave_room(&room_id).await;
+
+        if let Err(e) = &result {
+            eprintln!("Error: {e}");
+        }
+        assert!(result.is_ok());
+        room_mock.assert_async().await;
+        people_mock.assert_async().await;
+        membership_mock.assert_async().await;
+        delete_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_leave_room_user_not_member() {
+        let mut server = mockito::Server::new_async().await;
+
+        // Mock the GET /rooms/{id} API call to check room type
+        let room_mock = server
+            .mock("GET", "/rooms/Y2lzY29zcGFyazovL3VzL1JPT00vMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MDEy")
+            .match_header("authorization", "Bearer test_token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({
+                "id": "Y2lzY29zcGFyazovL3VzL1JPT00vMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MDEy",
+                "title": "Test Room",
+                "type": "group",
+                "isLocked": false,
+                "lastActivity": "2024-01-01T00:00:00.000Z",
+                "creatorId": "test_person_id",
+                "created": "2024-01-01T00:00:00.000Z"
+            }).to_string())
+            .create_async()
+            .await;
+
+        // Mock the people/me API call
+        let people_mock = server
+            .mock("GET", "/people/me")
+            .match_header("authorization", "Bearer test_token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "id": "test_person_id",
+                    "emails": ["test@example.com"],
+                    "displayName": "Test User",
+                    "orgId": "test_org_id",
+                    "created": "2024-01-01T00:00:00.000Z",
+                    "lastActivity": "2024-01-01T00:00:00.000Z",
+                    "status": "active",
+                    "type": "person"
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        // Mock the membership list API call returning empty list
+        let membership_mock = server
+            .mock("GET", "/memberships")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "roomId".into(),
+                "Y2lzY29zcGFyazovL3VzL1JPT00vMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MDEy"
+                    .into(),
+            ))
+            .match_header("authorization", "Bearer test_token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "items": []
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let webex_client = create_test_webex_client(&server);
+        let room_id = types::GlobalId::new(
+            types::GlobalIdType::Room,
+            "12345678-1234-1234-1234-123456789012".to_string(),
+        )
+        .unwrap();
+
+        let result = webex_client.leave_room(&room_id).await;
+
+        assert!(result.is_err());
+        if let Err(error) = result {
+            assert_eq!(error.to_string(), "User is not a member of this room");
+        }
+        room_mock.assert_async().await;
+        people_mock.assert_async().await;
+        membership_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_leave_room_api_error() {
+        let mut server = mockito::Server::new_async().await;
+
+        // Mock the GET /rooms/{id} API call to check room type
+        let room_mock = server
+            .mock("GET", "/rooms/Y2lzY29zcGFyazovL3VzL1JPT00vMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MDEy")
+            .match_header("authorization", "Bearer test_token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({
+                "id": "Y2lzY29zcGFyazovL3VzL1JPT00vMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MDEy",
+                "title": "Test Room",
+                "type": "group",
+                "isLocked": false,
+                "lastActivity": "2024-01-01T00:00:00.000Z",
+                "creatorId": "test_person_id",
+                "created": "2024-01-01T00:00:00.000Z"
+            }).to_string())
+            .create_async()
+            .await;
+
+        // Mock the people/me API call
+        let people_mock = server
+            .mock("GET", "/people/me")
+            .match_header("authorization", "Bearer test_token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "id": "test_person_id",
+                    "emails": ["test@example.com"],
+                    "displayName": "Test User",
+                    "orgId": "test_org_id",
+                    "created": "2024-01-01T00:00:00.000Z",
+                    "lastActivity": "2024-01-01T00:00:00.000Z",
+                    "status": "active",
+                    "type": "person"
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        // Mock the membership list API call returning error
+        let membership_mock = server
+            .mock("GET", "/memberships")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "roomId".into(),
+                "Y2lzY29zcGFyazovL3VzL1JPT00vMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MDEy"
+                    .into(),
+            ))
+            .match_header("authorization", "Bearer test_token")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "message": "Access denied",
+                    "errors": []
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let webex_client = create_test_webex_client(&server);
+        let room_id = types::GlobalId::new(
+            types::GlobalIdType::Room,
+            "12345678-1234-1234-1234-123456789012".to_string(),
+        )
+        .unwrap();
+
+        let result = webex_client.leave_room(&room_id).await;
+
+        assert!(result.is_err());
+        room_mock.assert_async().await;
+        people_mock.assert_async().await;
+        membership_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_leave_room_direct_room_error() {
+        let mut server = mockito::Server::new_async().await;
+
+        // Mock the GET /rooms/{id} API call - return a direct room
+        let room_mock = server
+            .mock("GET", "/rooms/Y2lzY29zcGFyazovL3VzL1JPT00vMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MDEy")
+            .match_header("authorization", "Bearer test_token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({
+                "id": "Y2lzY29zcGFyazovL3VzL1JPT00vMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MDEy",
+                "title": "Direct Chat",
+                "type": "direct",
+                "isLocked": false,
+                "lastActivity": "2024-01-01T00:00:00.000Z",
+                "creatorId": "test_person_id",
+                "created": "2024-01-01T00:00:00.000Z"
+            }).to_string())
+            .create_async()
+            .await;
+
+        let webex_client = create_test_webex_client(&server);
+        let room_id = types::GlobalId::new(
+            types::GlobalIdType::Room,
+            "12345678-1234-1234-1234-123456789012".to_string(),
+        )
+        .unwrap();
+
+        let result = webex_client.leave_room(&room_id).await;
+
+        assert!(result.is_err());
+        if let Err(error) = result {
+            assert!(error
+                .to_string()
+                .contains("Cannot leave a 1:1 direct message room"));
+        }
+        room_mock.assert_async().await;
     }
 }

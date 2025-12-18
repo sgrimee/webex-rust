@@ -25,12 +25,15 @@ pub enum Error {
     #[error("{0} Retry in: '{1:?}'")]
     Limited(StatusCode, Option<i64>),
     #[error("{0} {1}")]
-    Tungstenite(tokio_tungstenite::tungstenite::Error, String),
+    Tungstenite(Box<tokio_tungstenite::tungstenite::Error>, String),
     #[error("Webex API changed: {0}")]
     Api(&'static str),
 
     #[error("Authentication error")]
     Authentication,
+
+    #[error("{0}")]
+    UserError(String),
 
     // catch-all
     #[error("Unknown error: {0}")]
