@@ -183,18 +183,25 @@ impl Event {
     /// Also contains details about the event action for some event types.
     /// For more details, check [`ActivityType`].
     ///
-    /// # Panics
-    ///
-    /// Will panic if conversation activity is not set
+    /// Malformed conversation events are represented as `Unknown`, not panics.
     #[must_use]
     pub fn activity_type(&self) -> ActivityType {
-        match self.data.event_type.as_str() {
+        self.try_activity_type()
+            .unwrap_or_else(|_| ActivityType::Unknown("conversation.activity.missing".to_string()))
+    }
+
+    /// Get the activity type, rejecting a conversation event without an activity.
+    ///
+    /// # Errors
+    /// Returns an API error when a conversation activity is missing.
+    pub fn try_activity_type(&self) -> Result<ActivityType, crate::error::Error> {
+        let activity_type = match self.data.event_type.as_str() {
             "conversation.activity" => {
                 let activity_type = self
                     .data
                     .activity
                     .as_ref()
-                    .expect("Conversation activity should have activity set")
+                    .ok_or(crate::error::Error::Api("Missing activity in event"))?
                     .verb
                     .as_str();
                 #[allow(clippy::option_if_let_else)]
@@ -228,7 +235,8 @@ impl Event {
                 log::debug!("Unknown data.event_type `{e}`, returning Unknown");
                 ActivityType::Unknown(e.to_string())
             }
-        }
+        };
+        Ok(activity_type)
     }
 
     /// Extract a global ID from an activity.
@@ -263,7 +271,8 @@ impl Event {
             .activity
             .as_ref()
             .ok_or(crate::error::Error::Api("Missing activity in event"))?;
-        let id = match self.activity_type() {
+        let activity_type = self.try_activity_type()?;
+        let id = match activity_type {
             ActivityType::Space(SpaceActivity::Created) => self.room_id_of_space_created_event()?,
             ActivityType::Space(
                 SpaceActivity::Changed | SpaceActivity::Joined | SpaceActivity::Left,
@@ -272,7 +281,7 @@ impl Event {
             _ => activity.id.clone(),
         };
         Ok(GlobalId::new_with_cluster_unchecked(
-            self.activity_type().into(),
+            activity_type.into(),
             id,
             None,
         ))
@@ -293,7 +302,7 @@ impl Event {
     ///
     /// Returns an error if the event is not `Space::Created` or if activity is not set.
     fn room_id_of_space_created_event(&self) -> Result<String, crate::error::Error> {
-        if self.activity_type() != ActivityType::Space(SpaceActivity::Created) {
+        if self.try_activity_type()? != ActivityType::Space(SpaceActivity::Created) {
             return Err(crate::error::Error::Api(
                 "Expected space created event, got different activity type",
             ));
@@ -633,6 +642,27 @@ mod tests {
     }
 
     #[test]
+    fn missing_conversation_activity_is_an_error_not_a_panic() {
+        let event = Event {
+            data: EventData {
+                event_type: "conversation.activity".to_string(),
+                activity: None,
+                ..EventData::default()
+            },
+            ..Event::default()
+        };
+        assert_eq!(
+            event.activity_type(),
+            ActivityType::Unknown("conversation.activity.missing".to_string())
+        );
+        assert!(matches!(
+            event.try_activity_type(),
+            Err(error::Error::Api(_))
+        ));
+        assert!(matches!(event.try_global_id(), Err(error::Error::Api(_))));
+    }
+
+    #[test]
     fn msg_is_created() {
         assert!(MessageActivity::Posted.is_created());
         assert!(MessageActivity::Shared.is_created());
@@ -690,7 +720,7 @@ mod tests {
 
         assert_eq!(global_id.type_, GlobalIdType::Room);
         // The ID should be base64 encoded when created from a UUID
-        assert!(!global_id.id().is_empty());
+        assert_ne!(global_id.id(), "");
         assert_ne!(global_id.id(), uuid);
     }
 
@@ -717,7 +747,7 @@ mod tests {
             GlobalId::new_with_cluster(GlobalIdType::Room, uuid.to_string(), Some("eu")).unwrap();
 
         // The cluster should be encoded in the base64 ID
-        assert!(!global_id.id().is_empty());
+        assert_ne!(global_id.id(), "");
         assert_ne!(global_id.id(), uuid);
     }
 

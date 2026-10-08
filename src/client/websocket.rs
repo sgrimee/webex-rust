@@ -34,9 +34,8 @@ impl WebexEventStream {
     /// Returns an event or an error.
     ///
     /// # Errors
-    /// Returns an error when the underlying stream has a problem, but will
-    /// continue to work on subsequent calls to `next()` - the errors can safely
-    /// be ignored.
+    /// Returns an error when the underlying stream has a problem. Check
+    /// `is_open` after an error; a closed stream must be replaced.
     pub async fn next(&mut self) -> Result<Event, Error> {
         loop {
             let next = self.ws_stream.next();
@@ -52,7 +51,10 @@ impl WebexEventStream {
                 }
                 // Didn't time out
                 Ok(next_result) => match next_result {
-                    None => {}
+                    None => {
+                        self.is_open = false;
+                        return Err(Error::Closed("WebSocket stream ended".to_string()));
+                    }
                     Some(msg) => match msg {
                         Ok(msg) => {
                             if let Some(h_msg) = self.handle_message(msg)? {
@@ -86,21 +88,24 @@ impl WebexEventStream {
                 match serde_json::from_str(json) {
                     Ok(ev) => Ok(Some(ev)),
                     Err(e) => {
-                        warn!("Couldn't deserialize: {:?}.  Original JSON:\n{}", e, &json);
+                        warn!(
+                            "Couldn't deserialize WebSocket event ({} bytes): {e}",
+                            bytes.len()
+                        );
                         Err(e.into())
                     }
                 }
             }
             TMessage::Text(t) => {
-                debug!("text: {t}");
+                debug!("WebSocket text frame ({} bytes)", t.len());
                 Ok(None)
             }
             TMessage::Ping(_) => {
                 trace!("Ping!");
                 Ok(None)
             }
-            TMessage::Close(t) => {
-                debug!("close: {t:?}");
+            TMessage::Close(_) => {
+                debug!("WebSocket close frame");
                 self.is_open = false;
                 Err(Error::Closed("Web Socket Closed".to_string()))
             }
@@ -130,7 +135,7 @@ impl WebexEventStream {
                                 debug!("Authentication succeeded");
                                 Ok(())
                             }
-                            _ => Err(format!("Received {msg:?} in reply to auth message").into()),
+                            _ => Err("Unexpected WebSocket authentication reply".into()),
                         },
                         Err(e) => Err(format!("Received error from websocket: {e}").into()),
                     },
@@ -142,5 +147,28 @@ impl WebexEventStream {
                 "failed to send authentication".to_string(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stream_end_marks_connection_closed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let stream = tokio_tungstenite::accept_async(socket).await.unwrap();
+            drop(stream);
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let mut events = WebexEventStream::new(socket, Duration::from_secs(2));
+        assert!(events.next().await.is_err());
+        assert!(!events.is_open);
     }
 }
