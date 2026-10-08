@@ -215,7 +215,7 @@ impl RestClient {
         query: Option<&Q>,
         body: Option<Body<D>>,
     ) -> Result<R, Error> {
-        trace!("{method} {url}");
+        trace!("Webex HTTP {method} request");
         let mut req = self
             .web_client
             .request(method.parse().unwrap(), url)
@@ -246,7 +246,10 @@ impl RestClient {
         let response_text = response.text().await?;
 
         if status.is_success() {
-            trace!("Response: {response_text}");
+            trace!(
+                "Webex HTTP {status} response ({} bytes)",
+                response_text.len()
+            );
 
             // Handle empty responses (like 204 No Content)
             if response_text.is_empty() {
@@ -269,7 +272,7 @@ impl RestClient {
         url: &str,
         body: Option<Body<D>>,
     ) -> Result<R, Error> {
-        trace!("{method} {url}");
+        trace!("Webex HTTP {method} request");
         let mut req = self
             .web_client
             .request(method.parse().unwrap(), url)
@@ -295,7 +298,10 @@ impl RestClient {
         let response_text = response.text().await?;
 
         if status.is_success() {
-            trace!("Response: {response_text}");
+            trace!(
+                "Webex HTTP {status} response ({} bytes)",
+                response_text.len()
+            );
 
             // Handle empty responses (like 204 No Content)
             if response_text.is_empty() {
@@ -320,14 +326,14 @@ impl RestClient {
                     && url.contains("/teams")
                     && message.contains("Could not find teams")
                 {
-                    trace!("HTTP {status} for {url}: {message} (expected when not a team member)");
+                    trace!("HTTP {status} (expected when not a team member)");
                     return;
                 }
             }
         }
 
         // Log all other errors at error level
-        error!("HTTP {status}: {response_text}");
+        error!("HTTP {status} ({} response bytes)", response_text.len());
     }
 
     /// Handles error responses from the API.
