@@ -219,7 +219,8 @@ impl Event {
                             ActivityType::Space(type_)
                         } else {
                             log::error!(
-                                "Unknown activity type `{activity_type}`, returning Unknown"
+                                "Unknown Mercury activity type ({} bytes)",
+                                activity_type.len()
                             );
                             ActivityType::Unknown(format!("conversation.activity.{activity_type}"))
                         }
@@ -232,22 +233,20 @@ impl Event {
             "janus.user_sessions" => ActivityType::Janus,
             //"apheleia.subscription_update" ??
             e => {
-                log::debug!("Unknown data.event_type `{e}`, returning Unknown");
+                log::debug!("Unknown Mercury event type ({} bytes)", e.len());
                 ActivityType::Unknown(e.to_string())
             }
         };
         Ok(activity_type)
     }
 
-    /// Extract a global ID from an activity.
+    /// Extract a global ID from an activity. Malformed events return an error.
     ///
-    /// # Panics
-    ///
-    /// Will panic if the event is malformed and a global ID cannot be obtained.
+    /// # Errors
+    /// Returns an API error when the event does not contain a valid activity/ID.
     #[deprecated(since = "0.10.0", note = "please use `try_global_id` instead")]
-    pub fn get_global_id(&self) -> GlobalId {
+    pub fn get_global_id(&self) -> Result<GlobalId, crate::error::Error> {
         self.try_global_id()
-            .expect("Could not get global ID from event")
     }
 
     /// Extract a global ID from an activity.
