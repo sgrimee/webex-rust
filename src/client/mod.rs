@@ -4,8 +4,8 @@ use crate::adaptive_card::AdaptiveCard;
 use crate::error::Error;
 use crate::types::{
     Attachment, AttachmentAction, CatalogReply, DeviceData, DevicesReply, Gettable, GlobalId,
-    GlobalIdType, ListResult, Membership, MembershipListParams, Message, MessageEditParams,
-    MessageOut, Organization, Person, Room, RoomType, Team,
+    GlobalIdType, Membership, MembershipListParams, Message, MessageEditParams, MessageOut,
+    Organization, Person, Room, RoomListParams, RoomType, Team,
 };
 use futures::{future::try_join_all, try_join};
 use log::{debug, error, trace, warn};
@@ -305,24 +305,23 @@ impl Webex {
     }
 
     /// Get all rooms from all organizations that the client belongs to.
-    /// Will be slow as does multiple API calls (one to get teamless rooms, one to get teams, then
-    /// one per team).
+    ///
+    /// This performs one request for teamless rooms, one for teams, and one per team. Every list
+    /// request follows Webex pagination links, so large organizations are fully enumerated.
     pub async fn get_all_rooms(&self) -> Result<Vec<Room>, Error> {
         let (mut all_rooms, teams) = try_join!(self.list(), self.list::<Team>())?;
         let futures: Vec<_> = teams
-            .into_iter()
+            .iter()
             .map(|team| {
-                let params = [("teamId", team.id)];
-                self.client.api_get::<ListResult<Room>>(
-                    Room::API_ENDPOINT,
-                    Some(params),
-                    AuthorizationType::Bearer(&self.token),
-                )
+                self.list_with_params::<Room>(RoomListParams {
+                    team_id: Some(&team.id),
+                    ..RoomListParams::default()
+                })
             })
             .collect();
         let teams_rooms = try_join_all(futures).await?;
-        for room in teams_rooms {
-            all_rooms.extend(room.items.or(room.devices).unwrap_or_else(Vec::new));
+        for rooms in teams_rooms {
+            all_rooms.extend(rooms);
         }
         Ok(all_rooms)
     }
@@ -426,31 +425,26 @@ impl Webex {
             .await
     }
 
-    /// List resources of a type
+    /// List resources of a type.
+    ///
+    /// Webex pagination links are followed automatically. A large workspace can therefore require
+    /// multiple HTTP requests; use [`Self::list_with_params`] with a server-side filter to bound
+    /// the result set when appropriate.
     pub async fn list<T: Gettable + DeserializeOwned>(&self) -> Result<Vec<T>, Error> {
         self.client
-            .api_get::<ListResult<T>>(
-                T::API_ENDPOINT,
-                None::<()>,
-                AuthorizationType::Bearer(&self.token),
-            )
+            .list_without_params::<T>(&self.token, None)
             .await
-            .map(|result| result.items.or(result.devices).unwrap_or_default())
     }
 
-    /// List resources of a type, with parameters
+    /// List resources of a type with parameters.
+    ///
+    /// Parameters are sent only on the initial request. Subsequent pages use the absolute cursor
+    /// URL supplied by Webex in its `Link` response header.
     pub async fn list_with_params<T: Gettable + DeserializeOwned>(
         &self,
         list_params: T::ListParams<'_>,
     ) -> Result<Vec<T>, Error> {
-        self.client
-            .api_get::<ListResult<T>>(
-                T::API_ENDPOINT,
-                Some(list_params),
-                AuthorizationType::Bearer(&self.token),
-            )
-            .await
-            .map(|result| result.items.or(result.devices).unwrap_or_default())
+        self.client.list::<T>(&self.token, &list_params, None).await
     }
 
     /// Get the current user's ID, caching it for future calls

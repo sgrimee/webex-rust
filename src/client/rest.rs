@@ -32,6 +32,11 @@ enum Body<T: Serialize> {
 
 const BODY_NONE: Option<Body<()>> = None;
 
+/// Maximum number of pages followed for a single list request.
+///
+/// This bounds the work done if an API returns a cyclic or otherwise invalid pagination link.
+const MAX_PAGES: usize = 100;
+
 /// Implements low level REST requests to be used internally by the library.
 #[derive(Clone)]
 pub struct RestClient {
@@ -111,6 +116,37 @@ impl RestClient {
         full_url: &str,
     ) -> Result<R, Error> {
         self.request("GET", AuthorizationType::Bearer(token), full_url, BODY_NONE)
+            .await
+    }
+
+    /// Performs a GET request with query parameters and preserves its `Link` header.
+    async fn get_with_params_and_link<R: DeserializeOwned, P: Serialize>(
+        &self,
+        token: &str,
+        url: &str,
+        params: &P,
+        host: Option<&str>,
+    ) -> Result<(R, Option<String>), Error> {
+        let host_prefix =
+            host.map_or_else(|| self.get_legacy_host_prefix(url), ToString::to_string);
+        let full_url = format!("{host_prefix}/{url}");
+        self.request_with_query_and_link(
+            "GET",
+            AuthorizationType::Bearer(token),
+            &full_url,
+            Some(params),
+            BODY_NONE,
+        )
+        .await
+    }
+
+    /// Performs a GET request and preserves its `Link` header.
+    async fn get_with_url_and_link<R: DeserializeOwned>(
+        &self,
+        token: &str,
+        full_url: &str,
+    ) -> Result<(R, Option<String>), Error> {
+        self.request_and_link("GET", AuthorizationType::Bearer(token), full_url, BODY_NONE)
             .await
     }
 
@@ -206,6 +242,14 @@ impl RestClient {
         )
     }
 
+    /// Gets the host prefix used by the legacy endpoint-based API methods.
+    fn get_legacy_host_prefix(&self, rest_method: &str) -> String {
+        let endpoint = rest_method.split('?').next().unwrap_or(rest_method);
+        self.host_prefix
+            .get(endpoint)
+            .map_or_else(|| super::REST_HOST_PREFIX.to_string(), Clone::clone)
+    }
+
     /// Performs an HTTP request with query parameters and optional body.
     async fn request_with_query<R: DeserializeOwned, Q: Serialize, D: Serialize>(
         &self,
@@ -261,6 +305,42 @@ impl RestClient {
         }
     }
 
+    /// Performs an HTTP request with query parameters and optional body, preserving its `Link`
+    /// header for callers that need to follow pagination.
+    async fn request_with_query_and_link<R: DeserializeOwned, Q: Serialize, D: Serialize>(
+        &self,
+        method: &str,
+        auth: AuthorizationType<'_>,
+        url: &str,
+        query: Option<&Q>,
+        body: Option<Body<D>>,
+    ) -> Result<(R, Option<String>), Error> {
+        trace!("{method} {url}");
+        let mut req = self
+            .web_client
+            .request(method.parse().expect("HTTP method is a fixed literal"), url)
+            .header("User-Agent", format!("webex-rust/{}", super::CRATE_VERSION));
+
+        if let Some(params) = query {
+            req = req.query(params);
+        }
+
+        req = match auth {
+            AuthorizationType::None => req,
+            AuthorizationType::Bearer(token) => req.bearer_auth(token),
+            AuthorizationType::Basic { username, password } => {
+                req.basic_auth(username, Some(password))
+            }
+        };
+        req = match body {
+            Some(Body::Json(data)) => req.json(&data),
+            Some(Body::UrlEncoded(data)) => req.form(&data),
+            None => req,
+        };
+
+        Self::handle_response_with_link(req.send().await?, url).await
+    }
+
     /// Performs an HTTP request with the given method, URL, and optional body.
     async fn request<R: DeserializeOwned, D: Serialize>(
         &self,
@@ -305,6 +385,63 @@ impl RestClient {
             }
         } else {
             // Log errors with appropriate level based on context
+            Self::log_error(status, url, &response_text);
+            Err(Self::handle_error_response(status, response_text))
+        }
+    }
+
+    /// Performs an HTTP request and preserves its `Link` header for pagination.
+    async fn request_and_link<R: DeserializeOwned, D: Serialize>(
+        &self,
+        method: &str,
+        auth: AuthorizationType<'_>,
+        url: &str,
+        body: Option<Body<D>>,
+    ) -> Result<(R, Option<String>), Error> {
+        trace!("{method} {url}");
+        let mut req = self
+            .web_client
+            .request(method.parse().expect("HTTP method is a fixed literal"), url)
+            .header("User-Agent", format!("webex-rust/{}", super::CRATE_VERSION));
+
+        req = match auth {
+            AuthorizationType::None => req,
+            AuthorizationType::Bearer(token) => req.bearer_auth(token),
+            AuthorizationType::Basic { username, password } => {
+                req.basic_auth(username, Some(password))
+            }
+        };
+        req = match body {
+            Some(Body::Json(data)) => req.json(&data),
+            Some(Body::UrlEncoded(data)) => req.form(&data),
+            None => req,
+        };
+
+        Self::handle_response_with_link(req.send().await?, url).await
+    }
+
+    /// Parses a response and preserves its `Link` header for pagination.
+    async fn handle_response_with_link<R: DeserializeOwned>(
+        response: reqwest::Response,
+        url: &str,
+    ) -> Result<(R, Option<String>), Error> {
+        let link = response
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let status = response.status();
+        let response_text = response.text().await?;
+
+        if status.is_success() {
+            trace!("Response: {response_text}");
+            let parsed = if response_text.is_empty() {
+                serde_json::from_str("{}")?
+            } else {
+                serde_json::from_str(&response_text)?
+            };
+            Ok((parsed, link))
+        } else {
             Self::log_error(status, url, &response_text);
             Err(Self::handle_error_response(status, response_text))
         }
@@ -361,22 +498,71 @@ impl RestClient {
         self.get_with_url(token, &full_url).await
     }
 
+    /// Generic LIST request for any `Gettable` type without parameters.
+    pub async fn list_without_params<T: Gettable + DeserializeOwned>(
+        &self,
+        token: &str,
+        host: Option<&str>,
+    ) -> Result<Vec<T>, Error> {
+        let host_prefix = host.map_or_else(
+            || self.get_legacy_host_prefix(T::API_ENDPOINT),
+            ToString::to_string,
+        );
+        let full_url = format!("{host_prefix}/{}", T::API_ENDPOINT);
+        let (first, link): (ListResult<T>, Option<String>) = self
+            .request_and_link(
+                "GET",
+                AuthorizationType::Bearer(token),
+                &full_url,
+                BODY_NONE,
+            )
+            .await?;
+        self.collect_list_pages(token, first, link).await
+    }
+
     /// Generic LIST request for any `Gettable` type.
+    ///
+    /// Follows absolute URLs from `Link: <url>; rel="next"` headers and concatenates every page
+    /// in server order. Parameters are sent only with the initial request; follow-up requests use
+    /// the server-provided URL verbatim. A safety cap prevents an invalid link chain from looping.
     pub async fn list<T: Gettable + DeserializeOwned>(
         &self,
         token: &str,
         params: &T::ListParams<'_>,
         host: Option<&str>,
     ) -> Result<Vec<T>, Error> {
-        let list_result: ListResult<T> = self
-            .get_with_params(token, T::API_ENDPOINT, params, host)
+        let (first, link): (ListResult<T>, Option<String>) = self
+            .get_with_params_and_link(token, T::API_ENDPOINT, params, host)
             .await?;
+        self.collect_list_pages(token, first, link).await
+    }
 
-        // Handle both 'items' and 'devices' fields
-        Ok(list_result
-            .items
-            .or(list_result.devices)
-            .unwrap_or_default())
+    /// Collects the first list page and every subsequent `rel="next"` page.
+    async fn collect_list_pages<T: DeserializeOwned>(
+        &self,
+        token: &str,
+        first: ListResult<T>,
+        mut link: Option<String>,
+    ) -> Result<Vec<T>, Error> {
+        let mut items = first.items.or(first.devices).unwrap_or_default();
+        let mut page_count = 1;
+
+        while let Some(next_url) = link.as_deref().and_then(parse_next_link) {
+            if page_count >= MAX_PAGES {
+                return Err(Error::StatusText(
+                    StatusCode::LOOP_DETECTED,
+                    format!("pagination safety cap of {MAX_PAGES} pages exceeded"),
+                ));
+            }
+
+            let (page, next_link): (ListResult<T>, Option<String>) =
+                self.get_with_url_and_link(token, next_url).await?;
+            items.extend(page.items.or(page.devices).unwrap_or_default());
+            link = next_link;
+            page_count += 1;
+        }
+
+        Ok(items)
     }
 
     // Legacy API methods for compatibility with client/mod.rs
@@ -479,6 +665,55 @@ impl Default for RestClient {
     }
 }
 
+/// Returns the URL from the first `rel="next"` entry in an HTTP `Link` header.
+///
+/// Commas inside angle-bracketed URLs are not treated as link separators. Malformed entries are
+/// ignored rather than making an otherwise successful list response fail.
+fn parse_next_link(header: &str) -> Option<&str> {
+    let mut start = 0;
+    let mut angle_depth = 0;
+
+    for (index, character) in header
+        .char_indices()
+        .chain(std::iter::once((header.len(), ',')))
+    {
+        match character {
+            '<' => angle_depth += 1,
+            '>' if angle_depth > 0 => angle_depth -= 1,
+            ',' if angle_depth == 0 => {
+                let entry = header[start..index].trim();
+                start = index + 1;
+
+                let Some(url_start) = entry.find('<') else {
+                    continue;
+                };
+                let Some(url_end) = entry[url_start + 1..].find('>') else {
+                    continue;
+                };
+                let url_end = url_start + url_end + 1;
+                let url = &entry[url_start + 1..url_end];
+                let parameters = &entry[url_end + 1..];
+
+                let is_next = parameters.split(';').any(|parameter| {
+                    let Some(value) = parameter.trim().strip_prefix("rel=") else {
+                        return false;
+                    };
+                    value
+                        .trim_matches('"')
+                        .split_ascii_whitespace()
+                        .any(|relation| relation.eq_ignore_ascii_case("next"))
+                });
+                if is_next {
+                    return Some(url);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
 /// Extract title from HTML error page.
 fn extract_html_title(html: &str, status: StatusCode) -> String {
     if let (Some(start_pos), Some(end_pos)) = (html.find("<title>"), html.find("</title>")) {
@@ -488,4 +723,90 @@ fn extract_html_title(html: &str, status: StatusCode) -> String {
         }
     }
     format!("HTTP {} - HTML error page returned", status.as_u16())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, Eq, PartialEq)]
+    struct PageItem {
+        id: String,
+    }
+
+    impl Gettable for PageItem {
+        const API_ENDPOINT: &'static str = "page-items";
+        type ListParams<'a> = ();
+    }
+
+    #[test]
+    fn parses_next_link_among_multiple_relations() {
+        let header = concat!(
+            "<https://example.test/page-items?cursor=previous>; rel=prev, ",
+            "<https://example.test/page-items?cursor=next>; rel=\"NEXT\""
+        );
+
+        assert_eq!(
+            parse_next_link(header),
+            Some("https://example.test/page-items?cursor=next")
+        );
+    }
+
+    #[test]
+    fn ignores_malformed_or_non_next_links() {
+        assert_eq!(parse_next_link("not a link"), None);
+        assert_eq!(
+            parse_next_link("<https://example.test/page-items?cursor=previous>; rel=prev"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn list_follows_absolute_next_link() {
+        let mut server = mockito::Server::new_async().await;
+        let next_url = format!("{}/page-items?cursor=second", server.url());
+
+        let first = server
+            .mock("GET", "/page-items")
+            .match_header("authorization", "Bearer test-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &format!("<{next_url}>; rel=\"next\""))
+            .with_body(r#"{"items":[{"id":"first"}]}"#)
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", "/page-items")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "cursor".into(),
+                "second".into(),
+            ))
+            .match_header("authorization", "Bearer test-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"items":[{"id":"second"}]}"#)
+            .create_async()
+            .await;
+
+        let client = RestClient::new();
+        let items = client
+            .list::<PageItem>("test-token", &(), Some(&server.url()))
+            .await
+            .expect("paginated list succeeds");
+
+        assert_eq!(
+            items,
+            vec![
+                PageItem {
+                    id: "first".to_string(),
+                },
+                PageItem {
+                    id: "second".to_string(),
+                },
+            ]
+        );
+        first.assert_async().await;
+        second.assert_async().await;
+    }
 }

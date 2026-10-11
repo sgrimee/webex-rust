@@ -1,11 +1,13 @@
 //! Style types for Adaptive Cards including colors, spacing, weights, and alignment options.
 
 use serde::{Deserialize, Serialize};
+use strum_macros::EnumString;
 
 /// Color for text
 #[allow(missing_docs)]
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, EnumString, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
+#[strum(ascii_case_insensitive)]
 pub enum Color {
     Default,
     Dark,
@@ -18,8 +20,9 @@ pub enum Color {
 
 /// Style hint for Container.
 #[allow(missing_docs)]
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, EnumString, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[strum(ascii_case_insensitive)]
 pub enum ContainerStyle {
     Default,
     Emphasis,
@@ -31,8 +34,9 @@ pub enum ContainerStyle {
 
 /// Controls the amount of spacing between this element and the preceding element.
 #[allow(missing_docs)]
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, EnumString, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
+#[strum(ascii_case_insensitive)]
 pub enum Spacing {
     Default,
     None,
@@ -142,4 +146,20 @@ pub enum ImageSize {
     Small,
     Medium,
     Large,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Color, ContainerStyle, Spacing};
+    use std::str::FromStr;
+
+    #[test]
+    fn parses_adaptive_card_styles_case_insensitively() {
+        assert_eq!(Color::from_str("aCcEnT"), Ok(Color::Accent));
+        assert_eq!(
+            ContainerStyle::from_str("emPHASIS"),
+            Ok(ContainerStyle::Emphasis)
+        );
+        assert_eq!(Spacing::from_str("eXTRaLARge"), Ok(Spacing::ExtraLarge));
+    }
 }
