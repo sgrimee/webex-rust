@@ -88,7 +88,10 @@ impl WebexEventStream {
                 match serde_json::from_str(json) {
                     Ok(ev) => Ok(Some(ev)),
                     Err(e) => {
-                        warn!("Couldn't deserialize WebSocket event ({} bytes): {e}", bytes.len());
+                        warn!(
+                            "Couldn't deserialize WebSocket event ({} bytes): {e}",
+                            bytes.len()
+                        );
                         Err(e.into())
                     }
                 }
