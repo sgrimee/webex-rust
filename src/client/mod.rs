@@ -212,7 +212,7 @@ impl Webex {
 
         if let Ok(mut cache) = MERCURY_CACHE.lock() {
             let result = mercury_url.as_ref().map_or(Err(()), |url| Ok(url.clone()));
-            trace!("Saving mercury url to cache: {}=>{:?}", self.id, &result);
+            trace!("Saving mercury url to cache: {}=>{:?}", self.id, result);
             cache.insert(self.id, result);
         }
 
@@ -645,7 +645,7 @@ impl Webex {
     }
 
     async fn setup_devices(&self) -> Result<DeviceData, Error> {
-        trace!("Setting up new device: {}", &self.device);
+        trace!("Setting up new device: {}", self.device);
         self.client
             .api_post(
                 "devices",

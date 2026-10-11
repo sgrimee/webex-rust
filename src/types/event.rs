@@ -690,7 +690,7 @@ mod tests {
 
         assert_eq!(global_id.type_, GlobalIdType::Room);
         // The ID should be base64 encoded when created from a UUID
-        assert!(!global_id.id().is_empty());
+        assert_ne!(global_id.id(), "");
         assert_ne!(global_id.id(), uuid);
     }
 
@@ -717,7 +717,7 @@ mod tests {
             GlobalId::new_with_cluster(GlobalIdType::Room, uuid.to_string(), Some("eu")).unwrap();
 
         // The cluster should be encoded in the base64 ID
-        assert!(!global_id.id().is_empty());
+        assert_ne!(global_id.id(), "");
         assert_ne!(global_id.id(), uuid);
     }
 
