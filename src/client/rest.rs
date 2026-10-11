@@ -726,6 +726,7 @@ fn extract_html_title(html: &str, status: StatusCode) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::significant_drop_tightening)]
 mod tests {
     use super::*;
     use serde::Deserialize;
