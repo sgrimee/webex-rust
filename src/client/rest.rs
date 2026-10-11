@@ -222,7 +222,7 @@ impl RestClient {
     ) -> Result<R, Error> {
         let response = self.send_request(method, auth, url, query, body).await?;
         let response_text = response.text().await?;
-        trace!("Response: {response_text}");
+        trace!("Webex HTTP response ({} bytes)", response_text.len());
         if response_text.is_empty() {
             Ok(serde_json::from_str("{}")?)
         } else {
@@ -251,7 +251,7 @@ impl RestClient {
         query: Option<&Q>,
         body: Option<Body<D>>,
     ) -> Result<reqwest::Response, Error> {
-        trace!("{method} {url}");
+        trace!("Webex HTTP {method} request");
         let mut req = self
             .web_client
             .request(method.parse().unwrap(), url)
@@ -301,14 +301,14 @@ impl RestClient {
                     && url.contains("/teams")
                     && message.contains("Could not find teams")
                 {
-                    trace!("HTTP {status} for {url}: {message} (expected when not a team member)");
+                    trace!("HTTP {status} (expected when not a team member)");
                     return;
                 }
             }
         }
 
         // Log all other errors at error level
-        error!("HTTP {status}: {response_text}");
+        error!("HTTP {status} ({} response bytes)", response_text.len());
     }
 
     /// Handles error responses from the API.

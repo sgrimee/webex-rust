@@ -99,16 +99,12 @@ impl Webex {
             user_id: Arc::new(Mutex::new(None)),
         };
 
-        let devices_url = match webex.get_mercury_url().await {
-            Ok(url) => {
-                trace!("Fetched mercury url {url}");
-                url
-            }
-            Err(e) => {
-                debug!("Failed to fetch devices url, falling back to default");
-                debug!("Error: {e:?}");
-                DEFAULT_REGISTRATION_HOST_PREFIX.to_string()
-            }
+        let devices_url = if let Ok(url) = webex.get_mercury_url().await {
+            trace!("Fetched Mercury URL");
+            url
+        } else {
+            debug!("Failed to fetch devices URL, falling back to default");
+            DEFAULT_REGISTRATION_HOST_PREFIX.to_string()
         };
         webex
             .client
@@ -130,17 +126,17 @@ impl Webex {
             };
             let url = url::Url::parse(ws_url.as_str())
                 .map_err(|_| Error::from("Failed to parse ws_url"))?;
-            debug!("Connecting to {url:?}");
+            debug!("Connecting to Mercury WebSocket");
             match connect_async(url.as_str()).await {
                 Ok((mut ws_stream, _response)) => {
-                    debug!("Connected to {url}");
+                    debug!("Connected to Mercury WebSocket");
                     WebexEventStream::auth(&mut ws_stream, &s.token).await?;
                     debug!("Authenticated");
                     let timeout = Duration::from_secs(20);
                     Ok(WebexEventStream::new(ws_stream, timeout))
                 }
                 Err(e) => {
-                    warn!("Failed to connect to {url:?}: {e:?}");
+                    warn!("Failed to connect to Mercury WebSocket");
                     Err(Error::Tungstenite(
                         Box::new(e),
                         "Failed to connect to ws_url".to_string(),
@@ -156,7 +152,7 @@ impl Webex {
             .await?
             .iter()
             .filter(|d| d.name == self.device.name)
-            .inspect(|d| trace!("Kept device: {d}"))
+            .inspect(|_| trace!("Found matching Mercury device"))
             .cloned()
             .collect();
 
@@ -188,7 +184,7 @@ impl Webex {
                     Err(e)
                 }
                 _ => {
-                    error!("Failed to setup devices: {e}");
+                    error!("Failed to set up Mercury device");
                     Err(e)
                 }
             },
@@ -212,7 +208,7 @@ impl Webex {
 
         if let Ok(mut cache) = MERCURY_CACHE.lock() {
             let result = mercury_url.as_ref().map_or(Err(()), |url| Ok(url.clone()));
-            trace!("Saving mercury url to cache: {}=>{result:?}", self.id);
+            trace!("Caching Mercury URL discovery result");
             cache.insert(self.id, result);
         }
 
@@ -576,7 +572,7 @@ impl Webex {
     ///
     /// This method implements the following logic:
     /// - 404 Not Found → Create a new device
-    /// - 403 Forbidden → Log detailed OAuth scope error, attempt device creation
+    /// - 403 Forbidden → Log status only, attempt device creation
     /// - 429 Rate Limited → Pass through the error
     /// - Other errors → Log and return error
     async fn handle_get_devices_error(&self, e: Error) -> Result<Vec<DeviceData>, Error> {
@@ -586,8 +582,8 @@ impl Webex {
             }
             Error::Limited(_, _) => Err(e),
             _ => {
-                error!("Can't decode devices reply: {e}");
-                Err(format!("Can't decode devices reply: {e}").into())
+                error!("Device listing failed (response details redacted)");
+                Err(e)
             }
         }
     }
@@ -603,7 +599,7 @@ impl Webex {
                 debug!("No devices found (404), will create new device");
                 self.setup_devices().await.map(|device| vec![device])
             }
-            StatusCode::FORBIDDEN => self.handle_device_forbidden_error(&original_error).await,
+            StatusCode::FORBIDDEN => self.handle_device_forbidden_error().await,
             _ => {
                 error!("Unexpected HTTP status {status} when listing devices");
                 Err(original_error)
@@ -611,47 +607,29 @@ impl Webex {
         }
     }
 
-    /// Handle 403 Forbidden errors on device endpoints with detailed OAuth scope guidance.
-    async fn handle_device_forbidden_error(
-        &self,
-        original_error: &Error,
-    ) -> Result<Vec<DeviceData>, Error> {
-        // Extract error details if available
-        let details = match original_error {
-            Error::StatusText(_, msg) => Some(msg.as_str()),
-            _ => None,
-        };
-
-        // Log detailed error message with OAuth scope requirements
-        let scope_info = if let Some(msg) = details {
-            format!(
-                "Device endpoint returned 403 Forbidden: {msg}. \
-                 Token missing required OAuth scopes: spark:devices_write, spark:devices_read"
-            )
-        } else {
-            "Device endpoint returned 403 Forbidden. \
-             Token missing required OAuth scopes: spark:devices_write, spark:devices_read"
-                .to_string()
-        };
-        error!("{scope_info}");
-
-        // Attempt device creation anyway (sometimes list fails but create succeeds)
+    /// Handle 403 Forbidden on device listing without logging response contents.
+    async fn handle_device_forbidden_error(&self) -> Result<Vec<DeviceData>, Error> {
+        error!("Device listing returned HTTP 403; attempting device creation");
         match self.setup_devices().await {
             Ok(device) => {
-                debug!("Surprisingly, device creation succeeded despite 403 on list");
+                debug!("Device creation succeeded despite HTTP 403 on listing");
                 Ok(vec![device])
             }
-            Err(setup_err) => {
-                error!(
-                    "Device creation failed: {setup_err}. Cannot proceed without device access."
-                );
-                Err(Error::Status(StatusCode::FORBIDDEN))
-            }
+            Err(setup_err) => match setup_err {
+                Error::Status(code) | Error::StatusText(code, _) | Error::Limited(code, _) => {
+                    error!("Device creation failed (HTTP {code}; response details redacted)");
+                    Err(Error::Status(code))
+                }
+                other => {
+                    error!("Device creation failed (no HTTP status; details redacted)");
+                    Err(other)
+                }
+            },
         }
     }
 
     async fn setup_devices(&self) -> Result<DeviceData, Error> {
-        trace!("Setting up new device: {}", self.device);
+        trace!("Setting up new Mercury device");
         self.client
             .api_post(
                 "devices",

@@ -96,21 +96,24 @@ impl WebexEventStream {
                 match serde_json::from_str(json) {
                     Ok(ev) => Ok(Some(ev)),
                     Err(e) => {
-                        warn!("Couldn't deserialize: {e:?}.  Original JSON:\n{json}");
+                        warn!(
+                            "Couldn't deserialize WebSocket event ({} bytes): {e}",
+                            bytes.len()
+                        );
                         Err(e.into())
                     }
                 }
             }
             TMessage::Text(t) => {
-                debug!("text: {t}");
+                debug!("WebSocket text frame ({} bytes)", t.len());
                 Ok(None)
             }
             TMessage::Ping(_) => {
                 trace!("Ping!");
                 Ok(None)
             }
-            TMessage::Close(t) => {
-                debug!("close: {t:?}");
+            TMessage::Close(_) => {
+                debug!("WebSocket close frame");
                 self.is_open = false;
                 Err(Error::Closed("Web Socket Closed".to_string()))
             }
@@ -160,7 +163,7 @@ impl WebexEventStream {
                                 debug!("Authentication succeeded");
                                 Ok(())
                             }
-                            _ => Err(format!("Received {msg:?} in reply to auth message").into()),
+                            _ => Err("Unexpected WebSocket authentication reply".into()),
                         },
                         Err(e) => Err(format!("Received error from websocket: {e}").into()),
                     },
