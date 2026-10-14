@@ -259,7 +259,7 @@ impl RestClient {
         query: Option<&Q>,
         body: Option<Body<D>>,
     ) -> Result<R, Error> {
-        trace!("{method} {url}");
+        trace!("Webex HTTP {method} request");
         let mut req = self
             .web_client
             .request(method.parse().unwrap(), url)
@@ -290,7 +290,10 @@ impl RestClient {
         let response_text = response.text().await?;
 
         if status.is_success() {
-            trace!("Response: {response_text}");
+            trace!(
+                "Webex HTTP {status} response ({} bytes)",
+                response_text.len()
+            );
 
             // Handle empty responses (like 204 No Content)
             if response_text.is_empty() {
@@ -349,7 +352,7 @@ impl RestClient {
         url: &str,
         body: Option<Body<D>>,
     ) -> Result<R, Error> {
-        trace!("{method} {url}");
+        trace!("Webex HTTP {method} request");
         let mut req = self
             .web_client
             .request(method.parse().unwrap(), url)
@@ -375,7 +378,10 @@ impl RestClient {
         let response_text = response.text().await?;
 
         if status.is_success() {
-            trace!("Response: {response_text}");
+            trace!(
+                "Webex HTTP {status} response ({} bytes)",
+                response_text.len()
+            );
 
             // Handle empty responses (like 204 No Content)
             if response_text.is_empty() {
@@ -457,14 +463,14 @@ impl RestClient {
                     && url.contains("/teams")
                     && message.contains("Could not find teams")
                 {
-                    trace!("HTTP {status} for {url}: {message} (expected when not a team member)");
+                    trace!("HTTP {status} (expected when not a team member)");
                     return;
                 }
             }
         }
 
         // Log all other errors at error level
-        error!("HTTP {status}: {response_text}");
+        error!("HTTP {status} ({} response bytes)", response_text.len());
     }
 
     /// Handles error responses from the API.
@@ -604,13 +610,15 @@ impl RestClient {
             .map_or(super::REST_HOST_PREFIX, String::as_str);
         let full_url = format!("{prefix}/{rest_method}");
 
-        if let Some(params) = params {
-            // For params, we append them as query string
-            let _params = params; // params need to be serialized to query string but we'll keep simple for now
-        }
-
-        self.request("POST", auth, &full_url, Some(Body::Json(body)))
-            .await
+        // Params are sent as the query string, like `api_get`.
+        self.request_with_query(
+            "POST",
+            auth,
+            &full_url,
+            params.as_ref(),
+            Some(Body::Json(body)),
+        )
+        .await
     }
 
     /// Performs a PUT request with JSON body (legacy API name).
@@ -628,12 +636,14 @@ impl RestClient {
             .map_or(super::REST_HOST_PREFIX, String::as_str);
         let full_url = format!("{prefix}/{rest_method}");
 
-        if let Some(_params) = params {
-            // params are not currently used but kept for API compatibility
-        }
-
-        self.request("PUT", auth, &full_url, Some(Body::Json(body)))
-            .await
+        self.request_with_query(
+            "PUT",
+            auth,
+            &full_url,
+            params.as_ref(),
+            Some(Body::Json(body)),
+        )
+        .await
     }
 
     /// Performs a DELETE request (legacy API name).
@@ -650,11 +660,9 @@ impl RestClient {
             .map_or(super::REST_HOST_PREFIX, String::as_str);
         let full_url = format!("{prefix}/{rest_method}");
 
-        if let Some(_params) = params {
-            // params are not currently used but kept for API compatibility
-        }
-
-        let _: EmptyReply = self.request("DELETE", auth, &full_url, BODY_NONE).await?;
+        let _: EmptyReply = self
+            .request_with_query("DELETE", auth, &full_url, params.as_ref(), BODY_NONE)
+            .await?;
         Ok(())
     }
 }
@@ -809,5 +817,63 @@ mod tests {
         );
         first.assert_async().await;
         second.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn post_put_and_delete_send_their_query_params() {
+        #[derive(Serialize)]
+        struct Params {
+            alpha: &'static str,
+        }
+        let mut server = mockito::Server::new_async().await;
+        let query = || mockito::Matcher::UrlEncoded("alpha".into(), "one".into());
+        let post = server
+            .mock("POST", "/echo")
+            .match_query(query())
+            .match_body(mockito::Matcher::Json(serde_json::json!({"x": 1})))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"posted"}"#)
+            .create_async()
+            .await;
+        let put = server
+            .mock("PUT", "/echo")
+            .match_query(query())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"put"}"#)
+            .create_async()
+            .await;
+        let delete = server
+            .mock("DELETE", "/echo")
+            .match_query(query())
+            .with_status(204)
+            .create_async()
+            .await;
+        let mut prefixes = HashMap::new();
+        prefixes.insert("echo".to_string(), server.url());
+        let client = RestClient {
+            host_prefix: prefixes,
+            ..RestClient::new()
+        };
+        let auth = || AuthorizationType::Bearer("test-token");
+        let params = || Some(Params { alpha: "one" });
+        let posted: PageItem = client
+            .api_post("echo", serde_json::json!({"x": 1}), params(), auth())
+            .await
+            .expect("POST with params");
+        assert_eq!(posted.id, "posted");
+        let updated: PageItem = client
+            .api_put("echo", serde_json::json!({"x": 2}), params(), auth())
+            .await
+            .expect("PUT with params");
+        assert_eq!(updated.id, "put");
+        client
+            .api_delete("echo", params(), auth())
+            .await
+            .expect("DELETE with params");
+        post.assert_async().await;
+        put.assert_async().await;
+        delete.assert_async().await;
     }
 }

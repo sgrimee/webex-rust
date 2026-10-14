@@ -53,7 +53,13 @@ pub struct Webex {
     pub device: DeviceData,
     /// Cached user ID to avoid repeated /people/me calls
     user_id: Arc<Mutex<Option<String>>>,
+    /// Bound for one device's WebSocket connect plus stream authorization in
+    /// [`Webex::event_stream`]; a device that exceeds it is skipped.
+    device_connect_timeout: Duration,
 }
+
+/// Default bound for one Mercury device's connect plus authorization.
+pub const DEFAULT_DEVICE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Webex Event Stream handler
 impl Webex {
@@ -97,18 +103,15 @@ impl Webex {
                 ..DeviceData::default()
             },
             user_id: Arc::new(Mutex::new(None)),
+            device_connect_timeout: DEFAULT_DEVICE_CONNECT_TIMEOUT,
         };
 
-        let devices_url = match webex.get_mercury_url().await {
-            Ok(url) => {
-                trace!("Fetched mercury url {url}");
-                url
-            }
-            Err(e) => {
-                debug!("Failed to fetch devices url, falling back to default");
-                debug!("Error: {e:?}");
-                DEFAULT_REGISTRATION_HOST_PREFIX.to_string()
-            }
+        let devices_url = if let Ok(url) = webex.get_mercury_url().await {
+            trace!("Fetched Mercury URL");
+            url
+        } else {
+            debug!("Failed to fetch devices URL, falling back to default");
+            DEFAULT_REGISTRATION_HOST_PREFIX.to_string()
         };
         webex
             .client
@@ -118,8 +121,32 @@ impl Webex {
         webex
     }
 
+    /// Use a different bound for one device's connect plus authorization in
+    /// [`Webex::event_stream`] (default [`DEFAULT_DEVICE_CONNECT_TIMEOUT`]).
+    #[must_use]
+    pub const fn with_device_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.device_connect_timeout = timeout;
+        self
+    }
+
     /// Get an event stream handle
     pub async fn event_stream(&self) -> Result<WebexEventStream, Error> {
+        self.event_stream_preferring(None)
+            .await
+            .map(|(stream, _device)| stream)
+    }
+
+    /// Get an event stream handle, trying `known` first: the device a previous
+    /// call returned (same device name, with a WebSocket URL). Listing every
+    /// device can be a multi-megabyte download, so a reconnect that reuses the
+    /// remembered device skips it; the list is fetched only if `known` is
+    /// absent, belongs to another device name, or fails (bounded by the device
+    /// connect timeout). Returns the device actually used, for the next call.
+    /// The returned [`DeviceData`] carries device URLs: treat it as private.
+    pub async fn event_stream_preferring(
+        &self,
+        known: Option<&DeviceData>,
+    ) -> Result<(WebexEventStream, DeviceData), Error> {
         // Helper function to connect to a device
         // refactored out to make it easier to loop through all devices and also lazily create a
         // new one if needed
@@ -130,22 +157,39 @@ impl Webex {
             };
             let url = url::Url::parse(ws_url.as_str())
                 .map_err(|_| Error::from("Failed to parse ws_url"))?;
-            debug!("Connecting to {url:?}");
+            debug!("Connecting to Mercury WebSocket");
             match connect_async(url.as_str()).await {
                 Ok((mut ws_stream, _response)) => {
-                    debug!("Connected to {url}");
+                    debug!("Connected to Mercury WebSocket");
                     WebexEventStream::auth(&mut ws_stream, &s.token).await?;
                     debug!("Authenticated");
                     let timeout = Duration::from_secs(20);
                     Ok(WebexEventStream::new(ws_stream, timeout))
                 }
                 Err(e) => {
-                    warn!("Failed to connect to {url:?}: {e:?}");
+                    warn!("Failed to connect to Mercury WebSocket");
                     Err(Error::Tungstenite(
                         Box::new(e),
                         "Failed to connect to ws_url".to_string(),
                     ))
                 }
+            }
+        }
+
+        if let Some(device) =
+            known.filter(|device| device.name == self.device.name && device.ws_url.is_some())
+        {
+            match tokio::time::timeout(
+                self.device_connect_timeout,
+                connect_device(self, device.clone()),
+            )
+            .await
+            {
+                Ok(Ok(event_stream)) => {
+                    trace!("Reconnected to the remembered device.");
+                    return Ok((event_stream, device.clone()));
+                }
+                _ => debug!("Remembered Mercury device failed; listing devices"),
             }
         }
 
@@ -156,7 +200,7 @@ impl Webex {
             .await?
             .iter()
             .filter(|d| d.name == self.device.name)
-            .inspect(|d| trace!("Kept device: {d}"))
+            .inspect(|_| trace!("Found matching Mercury device"))
             .cloned()
             .collect();
 
@@ -169,16 +213,35 @@ impl Webex {
                 .cmp(&a.modification_time.unwrap_or(now))
         });
 
+        // Each attempt is bounded: a stale device whose WebSocket accepts but
+        // never completes the handshake or the authorization would otherwise
+        // consume the caller's whole budget, so later devices (or a fresh
+        // registration) were never tried.
         for device in devices {
-            if let Ok(event_stream) = connect_device(self, device).await {
-                trace!("Successfully connected to device.");
-                return Ok(event_stream);
+            match tokio::time::timeout(
+                self.device_connect_timeout,
+                connect_device(self, device.clone()),
+            )
+            .await
+            {
+                Ok(Ok(event_stream)) => {
+                    trace!("Successfully connected to device.");
+                    return Ok((event_stream, device));
+                }
+                Ok(Err(_)) => {}
+                Err(_) => warn!("Mercury device connect timed out; trying the next one"),
             }
         }
 
         // Failed to connect to any existing devices, creating new one
         match self.setup_devices().await {
-            Ok(device) => connect_device(self, device).await,
+            Ok(device) => tokio::time::timeout(
+                self.device_connect_timeout,
+                connect_device(self, device.clone()),
+            )
+            .await
+            .map_err(|_| Error::from("Mercury device connect timed out"))?
+            .map(|stream| (stream, device)),
             Err(e) => match &e {
                 Error::StatusText(status, _) if *status == StatusCode::FORBIDDEN => {
                     error!(
@@ -188,7 +251,7 @@ impl Webex {
                     Err(e)
                 }
                 _ => {
-                    error!("Failed to setup devices: {e}");
+                    error!("Failed to set up Mercury device");
                     Err(e)
                 }
             },
@@ -212,7 +275,7 @@ impl Webex {
 
         if let Ok(mut cache) = MERCURY_CACHE.lock() {
             let result = mercury_url.as_ref().map_or(Err(()), |url| Ok(url.clone()));
-            trace!("Saving mercury url to cache: {}=>{:?}", self.id, result);
+            trace!("Caching Mercury URL discovery result");
             cache.insert(self.id, result);
         }
 
@@ -570,7 +633,7 @@ impl Webex {
     ///
     /// This method implements the following logic:
     /// - 404 Not Found → Create a new device
-    /// - 403 Forbidden → Log detailed OAuth scope error, attempt device creation
+    /// - 403 Forbidden → Log status only, attempt device creation
     /// - 429 Rate Limited → Pass through the error
     /// - Other errors → Log and return error
     async fn handle_get_devices_error(&self, e: Error) -> Result<Vec<DeviceData>, Error> {
@@ -580,8 +643,8 @@ impl Webex {
             }
             Error::Limited(_, _) => Err(e),
             _ => {
-                error!("Can't decode devices reply: {e}");
-                Err(format!("Can't decode devices reply: {e}").into())
+                error!("Device listing failed (response details redacted)");
+                Err(e)
             }
         }
     }
@@ -597,7 +660,7 @@ impl Webex {
                 debug!("No devices found (404), will create new device");
                 self.setup_devices().await.map(|device| vec![device])
             }
-            StatusCode::FORBIDDEN => self.handle_device_forbidden_error(&original_error).await,
+            StatusCode::FORBIDDEN => self.handle_device_forbidden_error().await,
             _ => {
                 error!("Unexpected HTTP status {status} when listing devices");
                 Err(original_error)
@@ -605,47 +668,29 @@ impl Webex {
         }
     }
 
-    /// Handle 403 Forbidden errors on device endpoints with detailed OAuth scope guidance.
-    async fn handle_device_forbidden_error(
-        &self,
-        original_error: &Error,
-    ) -> Result<Vec<DeviceData>, Error> {
-        // Extract error details if available
-        let details = match original_error {
-            Error::StatusText(_, msg) => Some(msg.as_str()),
-            _ => None,
-        };
-
-        // Log detailed error message with OAuth scope requirements
-        let scope_info = if let Some(msg) = details {
-            format!(
-                "Device endpoint returned 403 Forbidden: {msg}. \
-                 Token missing required OAuth scopes: spark:devices_write, spark:devices_read"
-            )
-        } else {
-            "Device endpoint returned 403 Forbidden. \
-             Token missing required OAuth scopes: spark:devices_write, spark:devices_read"
-                .to_string()
-        };
-        error!("{scope_info}");
-
-        // Attempt device creation anyway (sometimes list fails but create succeeds)
+    /// Handle 403 Forbidden on device listing without logging response contents.
+    async fn handle_device_forbidden_error(&self) -> Result<Vec<DeviceData>, Error> {
+        error!("Device listing returned HTTP 403; attempting device creation");
         match self.setup_devices().await {
             Ok(device) => {
-                debug!("Surprisingly, device creation succeeded despite 403 on list");
+                debug!("Device creation succeeded despite HTTP 403 on listing");
                 Ok(vec![device])
             }
-            Err(setup_err) => {
-                error!(
-                    "Device creation failed: {setup_err}. Cannot proceed without device access."
-                );
-                Err(Error::Status(StatusCode::FORBIDDEN))
-            }
+            Err(setup_err) => match setup_err {
+                Error::Status(code) | Error::StatusText(code, _) | Error::Limited(code, _) => {
+                    error!("Device creation failed (HTTP {code}; response details redacted)");
+                    Err(Error::Status(code))
+                }
+                other => {
+                    error!("Device creation failed (no HTTP status; details redacted)");
+                    Err(other)
+                }
+            },
         }
     }
 
     async fn setup_devices(&self) -> Result<DeviceData, Error> {
-        trace!("Setting up new device: {}", self.device);
+        trace!("Setting up new Mercury device");
         self.client
             .api_post(
                 "devices",
@@ -777,6 +822,7 @@ mod tests {
             token: "test_token".to_string(),
             device,
             user_id: Arc::new(Mutex::new(None)),
+            device_connect_timeout: DEFAULT_DEVICE_CONNECT_TIMEOUT,
         }
     }
 
@@ -1081,5 +1127,157 @@ mod tests {
                 .contains("Cannot leave a 1:1 direct message room"));
         }
         room_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_hung_device_is_skipped_and_a_fresh_one_registered() {
+        // A "device" whose WebSocket endpoint accepts TCP but never answers.
+        let hung = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hung_addr = hung.local_addr().unwrap();
+        let _hold = tokio::spawn(async move {
+            // Keep the accepted socket open and silent.
+            let accepted = hung.accept().await;
+            std::future::pending::<()>().await;
+            drop(accepted);
+        });
+        // A port with nothing listening: the fresh device fails fast.
+        let refused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let refused_addr = refused.local_addr().unwrap();
+        drop(refused);
+
+        let mut server = mockito::Server::new_async().await;
+        let mut webex = create_test_webex_client(&server)
+            .with_device_connect_timeout(Duration::from_millis(300));
+        webex
+            .client
+            .host_prefix
+            .insert("devices".to_string(), server.url());
+        let name = webex.device.name.clone().unwrap();
+        let listed = server
+            .mock("GET", "/devices")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"devices": [{
+                    "name": name,
+                    "webSocketUrl": format!("ws://{hung_addr}/"),
+                    "modificationTime": "2026-01-01T00:00:00Z"
+                }]})
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let registered = server
+            .mock("POST", "/devices")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"name": name, "webSocketUrl": format!("ws://{refused_addr}/")}).to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let started = std::time::Instant::now();
+        let result = webex.event_stream().await;
+        assert!(result.is_err());
+        // The hung device cost one bounded attempt, then a fresh one was tried.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        listed.assert_async().await;
+        registered.assert_async().await;
+    }
+
+    /// A Mercury stand-in that completes the handshake and answers the
+    /// authorization with a pong, then keeps the socket open.
+    async fn mercury_stub() -> std::net::SocketAddr {
+        use futures::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                    let _auth = ws.next().await;
+                    ws.send(tungstenite::Message::Pong(Vec::new().into()))
+                        .await
+                        .unwrap();
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn a_remembered_device_reconnects_without_listing_devices() {
+        let mercury = mercury_stub().await;
+        let mut server = mockito::Server::new_async().await;
+        let mut webex =
+            create_test_webex_client(&server).with_device_connect_timeout(Duration::from_secs(2));
+        webex
+            .client
+            .host_prefix
+            .insert("devices".to_string(), server.url());
+        let name = webex.device.name.clone().unwrap();
+        let device = json!({"name": name, "webSocketUrl": format!("ws://{mercury}/")});
+        let listed = server
+            .mock("GET", "/devices")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "devices": [device.clone()] }).to_string())
+            .expect(1)
+            .create_async()
+            .await;
+
+        // First connect lists once and returns the device it used.
+        let (_stream, used) = webex.event_stream_preferring(None).await.unwrap();
+        assert_eq!(
+            used.ws_url.as_deref(),
+            Some(format!("ws://{mercury}/").as_str())
+        );
+        // Reconnecting with it skips the (expensive) list entirely.
+        let (_again, reused) = webex.event_stream_preferring(Some(&used)).await.unwrap();
+        assert_eq!(reused, used);
+        listed.assert_async().await;
+
+        // A remembered device that no longer answers falls back to the list.
+        let mut stale = used.clone();
+        stale.ws_url = Some("ws://127.0.0.1:9/".into());
+        let relisted = server
+            .mock("GET", "/devices")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "devices": [device] }).to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let (_fallback, fresh) = webex.event_stream_preferring(Some(&stale)).await.unwrap();
+        assert_eq!(fresh, used);
+        relisted.assert_async().await;
+        // A device of another name is never used as a shortcut.
+        let mut foreign = used;
+        foreign.name = Some("someone-else".into());
+        let listed_again = server
+            .mock("GET", "/devices")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "devices": [] }).to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let _ = server
+            .mock("POST", "/devices")
+            .with_status(500)
+            .create_async()
+            .await;
+        assert!(webex.event_stream_preferring(Some(&foreign)).await.is_err());
+        listed_again.assert_async().await;
     }
 }
