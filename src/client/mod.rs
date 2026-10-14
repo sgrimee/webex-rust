@@ -53,7 +53,13 @@ pub struct Webex {
     pub device: DeviceData,
     /// Cached user ID to avoid repeated /people/me calls
     user_id: Arc<Mutex<Option<String>>>,
+    /// Bound for one device's WebSocket connect plus stream authorization in
+    /// [`Webex::event_stream`]; a device that exceeds it is skipped.
+    device_connect_timeout: Duration,
 }
+
+/// Default bound for one Mercury device's connect plus authorization.
+pub const DEFAULT_DEVICE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Webex Event Stream handler
 impl Webex {
@@ -97,6 +103,7 @@ impl Webex {
                 ..DeviceData::default()
             },
             user_id: Arc::new(Mutex::new(None)),
+            device_connect_timeout: DEFAULT_DEVICE_CONNECT_TIMEOUT,
         };
 
         let devices_url = if let Ok(url) = webex.get_mercury_url().await {
@@ -112,6 +119,14 @@ impl Webex {
             .insert("devices".to_string(), devices_url);
 
         webex
+    }
+
+    /// Use a different bound for one device's connect plus authorization in
+    /// [`Webex::event_stream`] (default [`DEFAULT_DEVICE_CONNECT_TIMEOUT`]).
+    #[must_use]
+    pub const fn with_device_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.device_connect_timeout = timeout;
+        self
     }
 
     /// Get an event stream handle
@@ -165,16 +180,30 @@ impl Webex {
                 .cmp(&a.modification_time.unwrap_or(now))
         });
 
+        // Each attempt is bounded: a stale device whose WebSocket accepts but
+        // never completes the handshake or the authorization would otherwise
+        // consume the caller's whole budget, so later devices (or a fresh
+        // registration) were never tried.
         for device in devices {
-            if let Ok(event_stream) = connect_device(self, device).await {
-                trace!("Successfully connected to device.");
-                return Ok(event_stream);
+            match tokio::time::timeout(self.device_connect_timeout, connect_device(self, device))
+                .await
+            {
+                Ok(Ok(event_stream)) => {
+                    trace!("Successfully connected to device.");
+                    return Ok(event_stream);
+                }
+                Ok(Err(_)) => {}
+                Err(_) => warn!("Mercury device connect timed out; trying the next one"),
             }
         }
 
         // Failed to connect to any existing devices, creating new one
         match self.setup_devices().await {
-            Ok(device) => connect_device(self, device).await,
+            Ok(device) => {
+                tokio::time::timeout(self.device_connect_timeout, connect_device(self, device))
+                    .await
+                    .map_err(|_| Error::from("Mercury device connect timed out"))?
+            }
             Err(e) => match &e {
                 Error::StatusText(status, _) if *status == StatusCode::FORBIDDEN => {
                     error!(
@@ -755,6 +784,7 @@ mod tests {
             token: "test_token".to_string(),
             device,
             user_id: Arc::new(Mutex::new(None)),
+            device_connect_timeout: DEFAULT_DEVICE_CONNECT_TIMEOUT,
         }
     }
 
@@ -1059,5 +1089,67 @@ mod tests {
                 .contains("Cannot leave a 1:1 direct message room"));
         }
         room_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_hung_device_is_skipped_and_a_fresh_one_registered() {
+        // A "device" whose WebSocket endpoint accepts TCP but never answers.
+        let hung = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hung_addr = hung.local_addr().unwrap();
+        let _hold = tokio::spawn(async move {
+            // Keep the accepted socket open and silent.
+            let accepted = hung.accept().await;
+            std::future::pending::<()>().await;
+            drop(accepted);
+        });
+        // A port with nothing listening: the fresh device fails fast.
+        let refused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let refused_addr = refused.local_addr().unwrap();
+        drop(refused);
+
+        let mut server = mockito::Server::new_async().await;
+        let mut webex = create_test_webex_client(&server)
+            .with_device_connect_timeout(Duration::from_millis(300));
+        webex
+            .client
+            .host_prefix
+            .insert("devices".to_string(), server.url());
+        let name = webex.device.name.clone().unwrap();
+        let listed = server
+            .mock("GET", "/devices")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"devices": [{
+                    "name": name,
+                    "webSocketUrl": format!("ws://{hung_addr}/"),
+                    "modificationTime": "2026-01-01T00:00:00Z"
+                }]})
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let registered = server
+            .mock("POST", "/devices")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"name": name, "webSocketUrl": format!("ws://{refused_addr}/")}).to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let started = std::time::Instant::now();
+        let result = webex.event_stream().await;
+        assert!(result.is_err());
+        // The hung device cost one bounded attempt, then a fresh one was tried.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        listed.assert_async().await;
+        registered.assert_async().await;
     }
 }
