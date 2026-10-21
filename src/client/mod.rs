@@ -4,8 +4,8 @@ use crate::adaptive_card::AdaptiveCard;
 use crate::error::Error;
 use crate::types::{
     Attachment, AttachmentAction, CatalogReply, DeviceData, DevicesReply, Gettable, GlobalId,
-    GlobalIdType, Membership, MembershipListParams, Message, MessageEditParams, MessageOut,
-    Organization, Person, Room, RoomListParams, RoomType, Team,
+    GlobalIdType, ListResult, Membership, MembershipListParams, Message, MessageEditParams,
+    MessageOut, Organization, Person, Room, RoomType, Team,
 };
 use futures::{future::try_join_all, try_join};
 use log::{debug, error, trace, warn};
@@ -290,6 +290,7 @@ impl Webex {
         //
         // 4. Add caching because this doesn't change, and it can be slow
 
+        // Only the first organization is needed for discovery; one page is sufficient.
         let orgs = match self.list::<Organization>().await {
             Ok(orgs) => orgs,
             Err(e) => {
@@ -367,24 +368,26 @@ impl Webex {
         self.list().await
     }
 
-    /// Get all rooms from all organizations that the client belongs to.
+    /// Get rooms from all organizations that the client belongs to.
     ///
-    /// This performs one request for teamless rooms, one for teams, and one per team. Every list
-    /// request follows Webex pagination links, so large organizations are fully enumerated.
+    /// Performs one request for teamless rooms, one for teams, and one per returned team.
+    /// Each request returns only its first page; pagination links are not followed.
     pub async fn get_all_rooms(&self) -> Result<Vec<Room>, Error> {
         let (mut all_rooms, teams) = try_join!(self.list(), self.list::<Team>())?;
         let futures: Vec<_> = teams
-            .iter()
+            .into_iter()
             .map(|team| {
-                self.list_with_params::<Room>(RoomListParams {
-                    team_id: Some(&team.id),
-                    ..RoomListParams::default()
-                })
+                let params = [("teamId", team.id)];
+                self.client.api_get::<ListResult<Room>>(
+                    Room::API_ENDPOINT,
+                    Some(params),
+                    AuthorizationType::Bearer(&self.token),
+                )
             })
             .collect();
         let teams_rooms = try_join_all(futures).await?;
-        for rooms in teams_rooms {
-            all_rooms.extend(rooms);
+        for room in teams_rooms {
+            all_rooms.extend(room.items.or(room.devices).unwrap_or_default());
         }
         Ok(all_rooms)
     }
@@ -488,26 +491,35 @@ impl Webex {
             .await
     }
 
-    /// List resources of a type.
+    /// List one page of resources of a type.
     ///
-    /// Webex pagination links are followed automatically. A large workspace can therefore require
-    /// multiple HTTP requests; use [`Self::list_with_params`] with a server-side filter to bound
-    /// the result set when appropriate.
+    /// Does not follow Webex pagination links.
     pub async fn list<T: Gettable + DeserializeOwned>(&self) -> Result<Vec<T>, Error> {
         self.client
-            .list_without_params::<T>(&self.token, None)
+            .api_get::<ListResult<T>>(
+                T::API_ENDPOINT,
+                None::<()>,
+                AuthorizationType::Bearer(&self.token),
+            )
             .await
+            .map(|result| result.items.or(result.devices).unwrap_or_default())
     }
 
-    /// List resources of a type with parameters.
+    /// List one page of resources of a type with parameters.
     ///
-    /// Parameters are sent only on the initial request. Subsequent pages use the absolute cursor
-    /// URL supplied by Webex in its `Link` response header.
+    /// Does not follow Webex pagination links.
     pub async fn list_with_params<T: Gettable + DeserializeOwned>(
         &self,
         list_params: T::ListParams<'_>,
     ) -> Result<Vec<T>, Error> {
-        self.client.list::<T>(&self.token, &list_params, None).await
+        self.client
+            .api_get::<ListResult<T>>(
+                T::API_ENDPOINT,
+                Some(list_params),
+                AuthorizationType::Bearer(&self.token),
+            )
+            .await
+            .map(|result| result.items.or(result.devices).unwrap_or_default())
     }
 
     /// Get the current user's ID, caching it for future calls
@@ -824,6 +836,133 @@ mod tests {
             user_id: Arc::new(Mutex::new(None)),
             device_connect_timeout: DEFAULT_DEVICE_CONNECT_TIMEOUT,
         }
+    }
+
+    #[tokio::test]
+    async fn mercury_discovery_uses_only_first_organization_page() {
+        let mut server = mockito::Server::new_async().await;
+        let next_url = format!("{}/organizations?cursor=second", server.url());
+        let organizations = server
+            .mock("GET", "/organizations")
+            .match_header("authorization", "Bearer test_token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &format!("<{next_url}>; rel=\"next\""))
+            .with_body(
+                json!({"items": [{
+                    "id": "first-org",
+                    "created": "2026-01-01T00:00:00Z"
+                }]})
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", "/organizations")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "cursor".into(),
+                "second".into(),
+            ))
+            .with_status(500)
+            .expect(0)
+            .create_async()
+            .await;
+        let wdm_url = "https://wdm.example.test/wdm/api/v1";
+        let mut links = serde_json::Map::new();
+        for name in [
+            "atlas",
+            "broadworksIdpProxy",
+            "clientLogs",
+            "ecomm",
+            "fms",
+            "idbroker",
+            "idbroker-guest",
+            "identity",
+            "identity-guest-cs",
+            "license",
+            "meetingRegistry",
+            "metrics",
+            "oauth-helper",
+            "settings-service",
+            "u2c",
+            "web-authentication",
+            "webex-appapi-service",
+        ] {
+            links.insert(name.into(), json!("https://service.example.test"));
+        }
+        links.insert("wdm".into(), json!(wdm_url));
+        let catalog = server
+            .mock("GET", "/limited/catalog")
+            .match_header("authorization", "Bearer test_token")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("orgId".into(), "first-org".into()),
+                mockito::Matcher::UrlEncoded("format".into(), "hostmap".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({"serviceLinks": links}).to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let mut webex = create_test_webex_client(&server);
+        for endpoint in ["organizations", "limited/catalog"] {
+            webex
+                .client
+                .host_prefix
+                .insert(endpoint.into(), server.url());
+        }
+
+        assert_eq!(webex.get_mercury_url_uncached().await.unwrap(), wdm_url);
+        organizations.assert_async().await;
+        second.assert_async().await;
+        catalog.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_with_params_returns_only_first_page() {
+        #[derive(serde::Deserialize)]
+        struct Item {
+            id: String,
+        }
+        impl Gettable for Item {
+            const API_ENDPOINT: &'static str = "memberships";
+            type ListParams<'a> = [(&'a str, &'a str); 1];
+        }
+
+        let mut server = mockito::Server::new_async().await;
+        let next_url = format!("{}/memberships?cursor=second", server.url());
+        let first = server
+            .mock("GET", "/memberships")
+            .match_query(mockito::Matcher::UrlEncoded("roomId".into(), "room".into()))
+            .match_header("authorization", "Bearer test_token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &format!("<{next_url}>; rel=\"next\""))
+            .with_body(r#"{"items":[{"id":"first"}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", "/memberships")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "cursor".into(),
+                "second".into(),
+            ))
+            .with_status(500)
+            .expect(0)
+            .create_async()
+            .await;
+        let webex = create_test_webex_client(&server);
+
+        let items = webex
+            .list_with_params::<Item>([("roomId", "room")])
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "first");
+        first.assert_async().await;
+        second.assert_async().await;
     }
 
     #[tokio::test]

@@ -19,6 +19,13 @@ Not all features are fully-fleshed out, particularly the AdaptiveCard
 support (only a few serializations exist, enough to create a form with a
 		few choices, a text box, and a submit button).
 
+## Listing resources
+
+`Webex::list()`, `Webex::list_with_params()`, and `RestClient::list()` return
+one response page; they do not follow pagination links. `get_all_rooms()` also
+reads only one page per listing. Callers needing complete large datasets must
+handle pagination separately.
+
 # DISCLAIMER
 
 This crate is not maintained by Cisco, and not an official SDK.  The
